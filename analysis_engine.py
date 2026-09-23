@@ -1,7 +1,7 @@
 """
 analysis_engine.py
 ==================
-Backend analytics and modelling engine for the Philippine Senior High School Academic
+Backend analytics and modelling engine for the FEU High School Academic
 Performance Dashboard.
 
 This module is intentionally decoupled from the Streamlit front-end so that
@@ -56,6 +56,7 @@ from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.metrics import mean_absolute_error, r2_score, roc_auc_score
 from sklearn.preprocessing import LabelEncoder
 import warnings
+from pathlib import Path
 
 # -----------------------------------------------------------------------------
 # 0. CONFIGURATION & MAPPINGS
@@ -98,12 +99,7 @@ SUBJECT_NAME_MAPPING = {
     'Komunikasyon': 'Komunikasyon at Pananaliksik sa Wika at Kulturang Filipino',
     'Komunikasyon at Pananaliksik': 'Komunikasyon at Pananaliksik sa Wika at Kulturang Filipino',
     'Oral Communication': 'Oral Communication in Context',
-    'Oral Communiation in Context': 'Oral Communication in Context',
     'Pagbasa at Pagsusuri ng Ibat Ibang Teksto Tungo sa Pananaliksik': 'Pagbasa at Pagsusuri ng Iba\'t Ibang Teksto Tungo sa Pananaliksik',
-    'Physical Education 1': 'Health Optimizing Physical Education 1',
-    'Physical Education 2': 'Health Optimizing Physical Education 2',
-    'Physical Education 3': 'Health Optimizing Physical Education 3',
-    'Physical Education 4': 'Health Optimizing Physical Education 4',
     'Reading and Writing': 'Reading and Writing Skills',
     'Statistics and Probability (STEM)': 'Statistics and Probability',
     'Statistics and Probability (NON-STEM)': 'Statistics and Probability',
@@ -115,6 +111,35 @@ SUBJECT_NAME_MAPPING = {
     'Understanding Culture Society and Politics': 'Understanding Culture, Society, and Politics',
     'World Religion': 'Introduction to World Religions and Belief Systems'
 }
+
+# Input and analytical-record contract.  Support/administrative courses remain
+# available in the processed corpus for auditability, but they are explicitly
+# identified and cannot become valid academic model targets without a numeric
+# grade and a valid SHS curriculum context.
+REQUIRED_INPUT_COLUMNS = (
+    'student name', 'student sis', 'course', 'section sis', 'term sis',
+    'unposted final grade'
+)
+NON_ACADEMIC_COURSES = frozenset({
+    'Canvas Orientation Course For New Teachers',
+    'FEU HS Student Clearance SY 2021-22',
+    'Labster Simulations 2021-22',
+})
+VALID_SEMESTERS = frozenset({'S1', 'S2'})
+VALID_GRADE_LEVELS = frozenset({'11', '12'})
+VALID_STRANDS = frozenset({'STEM', 'ABM', 'HUMSS', 'GAS'})
+JHS_REQUIRED_INPUT_COLUMNS = (
+    'student name', 'student sis', 'course', 'course sis', 'term sis',
+    'unposted final grade'
+)
+JHS_GRADE_LEVELS = frozenset({'7', '8', '9', '10'})
+JHS_PERIOD_LABELS = ('Q1', 'Q2', 'Q3', 'Q4')
+
+
+def validate_input_schema(columns):
+    """Return missing required Canvas columns without mutating input data."""
+    available = set(columns)
+    return [column for column in REQUIRED_INPUT_COLUMNS if column not in available]
 
 # -----------------------------------------------------------------------------
 # 1. DATA LOADING & CLEANING
@@ -277,7 +302,7 @@ def load_and_process_data(csv_files):
     for file in csv_files:
         try:
             # Load only the six columns consumed by the pipeline.
-            df = pd.read_csv(file, usecols=['student name', 'student sis', 'course', 'section sis', 'term sis', 'unposted final grade'])
+            df = pd.read_csv(file, usecols=list(REQUIRED_INPUT_COLUMNS))
 
             # Resolve course-name variants immediately so all downstream
             # operations operate on a schema-stable canonical label set.
@@ -288,9 +313,13 @@ def load_and_process_data(csv_files):
             if df['raw_year'].isna().all(): df['raw_year'] = df['term sis'].str.extract(r'(\d{4})')
             # The (?:_|$) terminator handles terminal-semester records that drop
             # the trailing delimiter in Grade 12 final-semester exports.
-            df['semester'] = df['term sis'].str.extract(r'_(S[12])(?:_|$)')[0].fillna('S0')
+            # Only S1 and S2 are valid academic semesters.  Preserve an
+            # unparseable value as missing so it cannot silently become a
+            # fabricated semester-zero observation.
+            df['semester'] = df['term sis'].str.extract(r'_(S[12])(?:_|$)')[0]
             df = df.dropna(subset=['raw_year'])
             df['school_year'] = df['raw_year'].apply(lambda x: f"{x}-{int(x)+1}")
+            df['year_int'] = pd.to_numeric(df['raw_year'], errors='coerce').astype('Int64')
 
             # Extract strand, grade level, and section name from section SIS.
             extracted_info = df['section sis'].apply(process_section_info)
@@ -299,6 +328,20 @@ def load_and_process_data(csv_files):
             df['section_name'] = [x[2] for x in extracted_info]
 
             df['full_term'] = 'G' + df['grade_level'].astype(str) + '-' + df['semester']
+            df['school_level'] = 'SHS'
+            df['period_type'] = 'semester'
+            df['period_label'] = df['semester']
+            df['period_order'] = df['full_term'].map({
+                'G11-S1': 1, 'G11-S2': 2, 'G12-S1': 3, 'G12-S2': 4
+            })
+            df['academic_period'] = 'SHS-' + df['full_term'].astype('string')
+            df['curriculum_version'] = 'SHS_K12_CURRENT'
+            df['course_key'] = (
+                'SHS_' + df['course'].astype('string').str.upper()
+                .str.replace(r'[^A-Z0-9]+', '_', regex=True).str.strip('_')
+            )
+            df['source_file'] = Path(file).name
+            df['source_period'] = df['semester']
 
             all_data.append(df)
         except Exception as e:
@@ -311,12 +354,554 @@ def load_and_process_data(csv_files):
     # from all statistical operations.
     combined_df['numeric_grade'] = pd.to_numeric(combined_df['unposted final grade'], errors='coerce')
 
+    combined_df['record_type'] = np.where(
+        combined_df['course'].isin(NON_ACADEMIC_COURSES),
+        'support',
+        'academic'
+    )
+    combined_df['is_academic_grade_record'] = (
+        combined_df['record_type'].eq('academic') &
+        combined_df['numeric_grade'].notna() &
+        combined_df['semester'].isin(VALID_SEMESTERS) &
+        combined_df['grade_level'].astype(str).isin(VALID_GRADE_LEVELS) &
+        combined_df['strand'].isin(VALID_STRANDS)
+    )
+
     # Apply an ordered categorical to full_term so any sort() or groupby()
     # on this column returns terms in chronological curriculum order.
     term_order = ['G11-S1', 'G11-S2', 'G12-S1', 'G12-S2']
     combined_df['full_term'] = pd.Categorical(combined_df['full_term'], categories=term_order, ordered=True)
 
     return combined_df
+
+
+def _school_year_from_term(term_series):
+    """Extract a normalized ``YYYY-YYYY`` school year from Canvas term SIS."""
+    raw_year = term_series.astype('string').str.extract(r'(?:SY_)?(\d{4})', expand=False)
+    return raw_year, raw_year.apply(
+        lambda value: f"{value}-{int(value) + 1}" if pd.notna(value) else pd.NA
+    )
+
+
+def _jhs_subject_name(course_series):
+    """Remove the grade prefix while preserving the displayed JHS subject name."""
+    return (
+        course_series.astype('string').str.strip()
+        .str.replace(r'^Grade\s+(?:7|8|9|10)\s+', '', regex=True)
+        .str.strip()
+    )
+
+
+def _jhs_course_key(grade_series, subject_series):
+    """Create a stable analytical identity for a grade-specific JHS subject."""
+    return (
+        'JHS_G' + grade_series.astype('string').str.strip() + '_'
+        + subject_series.astype('string').str.upper()
+        .str.replace(r'[^A-Z0-9]+', '_', regex=True)
+        .str.strip('_')
+    )
+
+
+_JHS_FILE_SUFFIXES = frozenset({'.csv', '.xlsx', '.xls'})
+_JHS_QUARTER_FILENAME_RE = re.compile(
+    r'(?:^|_)Q([1-4])(?:_|\.|$)', re.IGNORECASE
+)
+_JHS_STANDARD_FILENAME_RE = re.compile(
+    r'(?:^|_)JHS_(\d{4})-(\d{4})_Q([1-4])(?:\.|$)', re.IGNORECASE
+)
+
+
+def _jhs_filename_metadata(file):
+    """Return the optional academic-year and required quarter from a filename.
+
+    The standardized form is ``JHS_YYYY-YYYY_Qn.<suffix>``.  Older exports
+    have several longer names, so the quarter fallback intentionally accepts
+    any filename containing an isolated ``Q1``--``Q4`` token.  The academic
+    year is then obtained from ``term sis`` for those legacy files.
+    """
+    name = Path(file).name
+    standard_match = _JHS_STANDARD_FILENAME_RE.search(name)
+    if standard_match:
+        start_year = int(standard_match.group(1))
+        end_year = int(standard_match.group(2))
+        if end_year != start_year + 1:
+            raise ValueError(
+                f'filename academic year is not consecutive: {name}'
+            )
+        return start_year, f'Q{standard_match.group(3)}'
+
+    quarter_match = _JHS_QUARTER_FILENAME_RE.search(name)
+    if not quarter_match:
+        raise ValueError('could not parse Q1-Q4 from filename')
+    return None, f'Q{quarter_match.group(1)}'
+
+
+def discover_jhs_files(folder='JHS_historical-grades'):
+    """Discover supported JHS quarter exports in deterministic order.
+
+    Standard future filenames should be ``JHS_YYYY-YYYY_Qn.csv``.  Existing
+    Excel exports and older filenames remain supported during migration. Files
+    without a Q1--Q4 token are ignored so unrelated workbooks in the folder
+    cannot enter the academic corpus accidentally.
+    """
+    root = Path(folder)
+    if not root.exists():
+        return []
+
+    discovered = []
+    for path in root.iterdir():
+        if not path.is_file() or path.suffix.lower() not in _JHS_FILE_SUFFIXES:
+            continue
+        try:
+            filename_year, quarter = _jhs_filename_metadata(path)
+        except ValueError:
+            continue
+        # Standardized names sort by AY and quarter. Legacy files are retained
+        # after them in deterministic filename order; normalized records carry
+        # their own school_year and are sorted downstream where needed.
+        sort_year = filename_year if filename_year is not None else 9999
+        discovered.append((sort_year, int(quarter[1]), path.name, str(path)))
+
+    return [entry[3] for entry in sorted(discovered)]
+
+
+def _read_jhs_gradebook(file):
+    """Read one JHS export according to its file extension."""
+    suffix = Path(file).suffix.lower()
+    if suffix == '.csv':
+        return pd.read_csv(file, usecols=list(JHS_REQUIRED_INPUT_COLUMNS))
+    if suffix in {'.xlsx', '.xls'}:
+        return pd.read_excel(file, sheet_name=0)
+    raise ValueError(f'unsupported JHS file type: {suffix or "missing extension"}')
+
+
+def load_jhs_gradebooks(files):
+    """Load JHS quarter exports as normalized records.
+
+    JHS exports use an annual Canvas term and encode Q1--Q4 in the source
+    filename. The loader accepts both the standardized CSV convention and the
+    existing Excel/legacy filenames. When a standardized filename includes an
+    academic year, it is validated against ``term sis``; for legacy filenames,
+    ``term sis`` remains the source of truth. The loader preserves quarter
+    records and does not calculate annual grades; ``aggregate_jhs_annual_grades``
+    performs that operation from all four quarter rows.
+    """
+    all_data = []
+    for file in files:
+        try:
+            source = _read_jhs_gradebook(file)
+            source.columns = source.columns.astype(str).str.strip()
+            # JHS requires course SIS in the source contract for traceability,
+            # although the displayed course name is the analytical identity.
+            missing_jhs = [c for c in JHS_REQUIRED_INPUT_COLUMNS if c not in source.columns]
+            if missing_jhs:
+                raise ValueError(f"missing JHS columns: {missing_jhs}")
+
+            filename_year, quarter = _jhs_filename_metadata(file)
+
+            df = source.copy()
+            df['course_raw'] = df['course'].astype('string').str.strip()
+            df['course'] = _jhs_subject_name(df['course'])
+            df['raw_year'], df['school_year'] = _school_year_from_term(df['term sis'])
+            if filename_year is not None:
+                term_years = pd.to_numeric(df['raw_year'], errors='coerce').dropna()
+                if not term_years.empty and not term_years.eq(filename_year).all():
+                    raise ValueError(
+                        f'filename year {filename_year} does not match term sis '
+                        f'year(s) {sorted(term_years.astype(int).unique())}'
+                    )
+                # This fallback keeps a correctly named export usable if its
+                # term SIS field is blank, while still rejecting mismatches.
+                df['raw_year'] = df['raw_year'].fillna(str(filename_year))
+                df['school_year'] = df['school_year'].fillna(
+                    f'{filename_year}-{filename_year + 1}'
+                )
+            df = df.dropna(subset=['raw_year', 'student sis', 'course'])
+            df['year_int'] = pd.to_numeric(df['raw_year'], errors='coerce').astype('Int64')
+            df['grade_level'] = df['course_raw'].str.extract(
+                r'^Grade\s+(7|8|9|10)\b', expand=False
+            )
+            df['course_key'] = _jhs_course_key(df['grade_level'], df['course'])
+            df['period_type'] = 'quarter'
+            df['period_label'] = quarter
+            df['period_order'] = int(quarter[1])
+            df['academic_period'] = (
+                'JHS-G' + df['grade_level'].astype('string') + '-' + quarter
+            )
+            df['curriculum_version'] = 'JHS_CURRENT'
+            df['school_level'] = 'JHS'
+            df['strand'] = pd.NA
+            df['section_name'] = pd.NA
+            df['semester'] = pd.NA
+            df['full_term'] = pd.NA
+            df['source_file'] = Path(file).name
+            df['source_period'] = quarter
+            df['numeric_grade'] = pd.to_numeric(
+                df['unposted final grade'], errors='coerce'
+            )
+            df['record_type'] = 'academic'
+            df['is_academic_grade_record'] = (
+                df['numeric_grade'].notna()
+                & df['grade_level'].astype('string').isin(JHS_GRADE_LEVELS)
+            )
+            df['is_canonical_attainment'] = False
+            df['quarter_count'] = 1
+            df['is_annual_complete'] = False
+            all_data.append(df)
+        except Exception as exc:
+            print(f"Warning: Could not process JHS file {file}. Error: {exc}")
+
+    if not all_data:
+        return pd.DataFrame()
+
+    result = pd.concat(all_data, ignore_index=True, sort=False)
+    result['year_int'] = pd.to_numeric(result['year_int'], errors='coerce').astype('Int64')
+    return result
+
+
+def aggregate_jhs_annual_grades(jhs_quarter_records):
+    """Calculate annual JHS subject grades from the four quarter records.
+
+    The annual value is populated only when all Q1--Q4 grades are present.
+    Incomplete records remain in the annual table with a blank ``numeric_grade``
+    and ``quarter_count`` indicating how many quarter values are available.
+    """
+    if jhs_quarter_records is None or jhs_quarter_records.empty:
+        return pd.DataFrame()
+
+    source = jhs_quarter_records.copy()
+    if 'school_level' in source.columns:
+        source = source[source['school_level'].eq('JHS')]
+    source = source[
+        source.get('period_type', pd.Series(index=source.index, dtype='object')).eq('quarter')
+    ]
+    source = source[source['is_academic_grade_record']].copy()
+    if source.empty:
+        return pd.DataFrame()
+
+    keys = [
+        'student sis', 'school_year', 'year_int', 'grade_level',
+        'course', 'course_key'
+    ]
+    values = source.pivot_table(
+        index=keys, columns='period_label', values='numeric_grade', aggfunc='mean'
+    ).reset_index()
+    for quarter in JHS_PERIOD_LABELS:
+        if quarter not in values.columns:
+            values[quarter] = np.nan
+    values['quarter_count'] = values[list(JHS_PERIOD_LABELS)].notna().sum(axis=1)
+    values['numeric_grade'] = values[list(JHS_PERIOD_LABELS)].mean(axis=1)
+    values.loc[values['quarter_count'] != 4, 'numeric_grade'] = np.nan
+
+    metadata_sort = [column for column in ['period_order', 'source_file'] if column in source.columns]
+    names = (
+        source.sort_values(metadata_sort)
+        .groupby(keys, as_index=False, dropna=False, observed=True)['student name']
+        .agg(lambda series: series.mode().iloc[0] if not series.mode().empty else series.iloc[0])
+    )
+    annual = values.merge(names, on=keys, how='left', validate='one_to_one')
+    annual['course_raw'] = (
+        'Grade ' + annual['grade_level'].astype('string') + ' ' + annual['course']
+    )
+    annual['period_type'] = 'annual'
+    annual['period_label'] = 'Annual'
+    annual['period_order'] = 5
+    annual['academic_period'] = (
+        'JHS-G' + annual['grade_level'].astype('string') + '-Annual'
+    )
+    annual['curriculum_version'] = 'JHS_CURRENT'
+    annual['school_level'] = 'JHS'
+    annual['strand'] = pd.NA
+    annual['section_name'] = pd.NA
+    annual['semester'] = pd.NA
+    annual['full_term'] = pd.NA
+    annual['source_file'] = 'JHS_ANNUAL_AGGREGATE'
+    annual['source_period'] = 'Q1-Q4 average'
+    annual['unposted final grade'] = annual['numeric_grade']
+    annual['record_type'] = 'academic'
+    annual['is_annual_complete'] = annual['quarter_count'].eq(4)
+    annual['is_canonical_attainment'] = annual['is_annual_complete']
+    annual['is_academic_grade_record'] = annual['is_annual_complete'] & annual['numeric_grade'].notna()
+    annual['Q1'], annual['Q2'], annual['Q3'], annual['Q4'] = [
+        annual[q] for q in JHS_PERIOD_LABELS
+    ]
+    return annual.reset_index(drop=True)
+
+
+def load_combined_data(csv_files, jhs_files):
+    """Load SHS semesters and JHS quarter/annual records for the app."""
+    shs = load_and_process_data(csv_files)
+    jhs_quarters = load_jhs_gradebooks(jhs_files)
+    jhs_annual = aggregate_jhs_annual_grades(jhs_quarters)
+    frames = [frame for frame in (shs, jhs_quarters, jhs_annual) if not frame.empty]
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    combined['school_level'] = combined['school_level'].fillna('SHS')
+    combined['course_key'] = combined['course_key'].fillna(
+        'SHS_' + combined['course'].astype('string').str.upper()
+        .str.replace(r'[^A-Z0-9]+', '_', regex=True).str.strip('_')
+    )
+    combined['period_type'] = combined.get(
+        'period_type', pd.Series('semester', index=combined.index)
+    ).fillna('semester')
+    combined['period_label'] = combined['period_label'].fillna(combined['semester'])
+    combined['source_file'] = combined.get('source_file', pd.NA)
+    combined['source_period'] = combined['source_period'].fillna(combined['semester'])
+    combined['year_int'] = pd.to_numeric(
+        combined.get('year_int', combined['school_year'].str[:4]), errors='coerce'
+    ).astype('Int64')
+    return _compact_combined_dtypes(combined.reset_index(drop=True))
+
+
+_COMBINED_CATEGORY_COLUMNS = [
+    'student name', 'student sis', 'course', 'section sis', 'term sis',
+    'school_year', 'raw_year', 'semester', 'strand', 'grade_level',
+    'section_name', 'full_term', 'school_level', 'period_type',
+    'period_label', 'record_type', 'course_key', 'course_raw',
+    'academic_period', 'curriculum_version', 'source_file', 'source_period'
+]
+_COMBINED_NUMERIC_COLUMNS = [
+    'numeric_grade', 'unposted final grade', 'year_int', 'period_order',
+    'quarter_count', 'Q1', 'Q2', 'Q3', 'Q4'
+]
+
+
+def _compact_combined_dtypes(frame):
+    """Reduce the resident combined-corpus footprint without changing columns.
+
+    The dashboard repeatedly compares a small set of labels (course, student,
+    school year, level, and period). Categorical storage shares those labels
+    instead of keeping a separate Python string object in every row. Numeric
+    grades and period fields are downcast where safe. The column set is left
+    intact so downstream analysis and future-forecast code retain the same
+    schema and raw identifiers.
+    """
+    result = frame
+    for column in _COMBINED_CATEGORY_COLUMNS:
+        if column in result.columns and not isinstance(
+            result[column].dtype, pd.CategoricalDtype
+        ):
+            result[column] = result[column].astype('category')
+
+    for column in _COMBINED_NUMERIC_COLUMNS:
+        if column not in result.columns:
+            continue
+        if pd.api.types.is_numeric_dtype(result[column]):
+            kind = result[column].dtype.kind
+            result[column] = pd.to_numeric(
+                result[column],
+                downcast='float' if kind == 'f' else 'integer'
+            )
+
+    return result
+
+
+def get_jhs_overview_metrics(df):
+    """Return JHS metrics, including grade-level performance summaries."""
+    if df is None or df.empty:
+        return {}
+    grades = df['numeric_grade'].dropna()
+    if grades.empty:
+        return {}
+    grade_stats = df.dropna(subset=['grade_level', 'numeric_grade']).groupby('grade_level', observed=True)['numeric_grade'].agg(
+        Avg='mean',
+        PassRate=lambda values: (values >= 75).mean() * 100
+    )
+    grade_stats = grade_stats.reindex(
+        sorted(grade_stats.index, key=lambda value: int(str(value)))
+    )
+    return {
+        'Total Students': f"{df['student sis'].nunique():,}",
+        'Average Grade': float(grades.mean()),
+        'Passing Rate': float((grades >= 75).mean() * 100),
+        'Subjects': int(df['course'].nunique()),
+        'Grade Levels': grade_stats.round(2).to_dict('index'),
+        'Grade Level Count': int(df['grade_level'].nunique()),
+    }
+
+
+def plot_jhs_subject_extremes_split(df, school_year=None, grade_level=None, rank_count=3):
+    """Render JHS subject extremes grouped by grade level.
+
+    The chart intentionally uses the same two-panel bar treatment as SHS.
+    Within each grade level, rank letters identify the displayed subjects:
+    ``A`` is the most extreme rank and the final displayed letter is the least
+    extreme rank.  JHS defaults to three ranks because the corpus has eight
+    subjects per grade level.
+    """
+    subset = df.copy()
+    if school_year is not None:
+        subset = subset[subset['school_year'] == school_year]
+    if grade_level is not None:
+        subset = subset[subset['grade_level'].astype(str) == str(grade_level)]
+    subset = subset.dropna(subset=['course', 'numeric_grade'])
+    if subset.empty:
+        return None, None
+    stats_df = subset.groupby(['grade_level', 'course'], as_index=False, observed=True)['numeric_grade'].mean()
+    grade_order = sorted(stats_df['grade_level'].astype(str).unique(), key=lambda value: int(value))
+    rank_count = max(1, min(int(rank_count), 5))
+
+    red_gradient = ['#4d192b', '#872c4c', '#c13e6c', '#d37898', '#e6b2c4']
+    green_gradient = ['#0f5745', '#1b9878', '#26d9ac', '#67e4c5', '#a8f0de']
+
+    def hex_to_rgba(hex_code, alpha=1.0):
+        hex_code = hex_code.lstrip('#')
+        return (
+            f'rgba({int(hex_code[0:2], 16)}, {int(hex_code[2:4], 16)}, '
+            f'{int(hex_code[4:6], 16)}, {alpha})'
+        )
+
+    def style_ranked(frame, palette):
+        frame = frame.reset_index(drop=True)
+        frame['rank'] = frame.groupby('grade_level', sort=False).cumcount()
+        frame['rank_label'] = frame['rank'].map(lambda rank: chr(ord('A') + rank))
+        frame['x_label'] = frame.apply(
+            lambda row: f"G{str(row['grade_level']).zfill(2)}-{row['rank_label']}", axis=1
+        )
+        frame['solid'] = frame['rank'].map(lambda r: palette[min(r, len(palette) - 1)])
+        frame['fill'] = frame['solid'].map(
+            lambda color: hex_to_rgba(color, 0.5)
+        )
+        return frame
+
+    hardest_parts = []
+    easiest_parts = []
+    for grade in grade_order:
+        grade_stats = stats_df[stats_df['grade_level'].astype(str) == grade]
+        hardest_parts.append(grade_stats.sort_values('numeric_grade', ascending=True).head(rank_count))
+        easiest_parts.append(grade_stats.sort_values('numeric_grade', ascending=False).head(rank_count))
+    hardest = style_ranked(pd.concat(hardest_parts, ignore_index=True), red_gradient)
+    easiest = style_ranked(pd.concat(easiest_parts, ignore_index=True), green_gradient)
+    suffix = f" ({school_year})" if school_year else " (All Time)"
+
+    fig_hard = go.Figure(go.Bar(
+        x=hardest['x_label'], y=hardest['numeric_grade'],
+        marker_color=hardest['fill'].tolist(),
+        marker_line_color=hardest['solid'].tolist(), marker_line_width=2,
+        name='Hardest Subjects', text=hardest['numeric_grade'].map(lambda x: f'{x:.1f}'),
+        textposition='outside',
+        showlegend=False,
+        customdata=np.column_stack((hardest['course'], hardest['grade_level'])),
+        hovertemplate='<b>%{customdata[0]}</b><br>Grade Level: %{customdata[1]}<br>Average: %{y:.1f}<extra></extra>'
+    ))
+    fig_easy = go.Figure(go.Bar(
+        x=easiest['x_label'], y=easiest['numeric_grade'],
+        marker_color=easiest['fill'].tolist(),
+        marker_line_color=easiest['solid'].tolist(), marker_line_width=2,
+        name='Easiest Subjects', text=easiest['numeric_grade'].map(lambda x: f'{x:.1f}'),
+        textposition='outside',
+        showlegend=False,
+        customdata=np.column_stack((easiest['course'], easiest['grade_level'])),
+        hovertemplate='<b>%{customdata[0]}</b><br>Grade Level: %{customdata[1]}<br>Average: %{y:.1f}<extra></extra>'
+    ))
+    for fig, title in ((fig_hard, f'🔴 Lowest Mean Grades {suffix}'),
+                       (fig_easy, f'🟢 Highest Mean Grades {suffix}')):
+        fig.update_layout(
+            title=title, height=400, yaxis_title='Average Grade',
+            yaxis_range=[70, 101], showlegend=True,
+            xaxis=dict(title='Subjects by Grade Level'), bargap=0.1,
+            bargroupgap=0.1,
+            legend=dict(orientation='h', yanchor='top', y=-0.25,
+                        xanchor='center', x=0.5)
+        )
+        for rank in range(rank_count):
+            label = chr(ord('A') + rank)
+            if 'Lowest' in title:
+                description = 'Most difficult shown' if rank == 0 else (
+                    'Least difficult shown' if rank == rank_count - 1 else 'Ranked difficult'
+                )
+            else:
+                description = 'Easiest shown' if rank == 0 else (
+                    'Least easy shown' if rank == rank_count - 1 else 'Ranked easy'
+                )
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode='markers', name=f'{label} = {description}',
+                marker=dict(size=9, color=(red_gradient if 'Lowest' in title else green_gradient)[rank]),
+                showlegend=True
+            ))
+    return fig_hard, fig_easy
+
+
+def plot_jhs_grade_distribution_interactive(df):
+    """Render JHS grade distributions by grade level and academic year."""
+    clean = df.dropna(subset=['numeric_grade']).copy()
+    color_map = get_color_map(clean) if not clean.empty else {}
+    fig = px.box(
+        clean, x='grade_level', y='numeric_grade', color='school_year',
+        labels={'numeric_grade': 'Final Grade', 'grade_level': 'Grade Level',
+                'school_year': 'School Year'}, color_discrete_map=color_map
+    )
+    fig.update_layout(
+        xaxis_title='Grade Level', yaxis_title='Grade',
+        legend=dict(
+            orientation='h', yanchor='top', y=-0.2,
+            xanchor='center', x=0.5
+        ), margin=dict(b=80)
+    )
+    return fig
+
+
+def plot_jhs_grade_density_interactive(df):
+    """Render KDE curves for JHS quarter or annual grades by school year."""
+    fig = go.Figure()
+    color_map = get_color_map(df)
+    for idx, year in enumerate(sorted(df['school_year'].dropna().unique())):
+        values = df.loc[df['school_year'] == year, 'numeric_grade'].dropna()
+        if len(values) < 2 or values.nunique() < 2:
+            continue
+        kde = stats.gaussian_kde(values)
+        x = np.linspace(values.min(), values.max(), 200)
+        fig.add_trace(go.Scatter(
+            x=x, y=kde(x) * 100, mode='lines',
+            name=f'{year} (N={len(values)})', fill='tozeroy',
+            line=dict(
+                color=color_map.get(year, px.colors.qualitative.Bold[
+                    idx % len(px.colors.qualitative.Bold)
+                ]), width=2
+            ),
+            opacity=0.3,
+            hovertemplate='<b>%{fullData.name}</b><br>Grade: %{x:.1f}<br>Density: %{y:.1f}%<extra></extra>'
+        ))
+    fig.update_layout(
+        xaxis_title='Numeric Grade', yaxis_title='Density (%)',
+        hovermode='closest',
+        legend=dict(
+            orientation='h', yanchor='top', y=-0.2,
+            xanchor='center', x=0.5
+        ), margin=dict(b=80)
+    )
+    return fig
+
+
+def get_jhs_subgroup_statistics(df, school_year, grade, period_label='Annual', group_type='top'):
+    """Isolate top/bottom JHS students using the selected reporting period."""
+    subset = df[
+        (df['school_year'] == school_year)
+        & (df['grade_level'].astype(str) == str(grade))
+        & (df['period_label'] == period_label)
+    ].dropna(subset=['numeric_grade']).copy()
+    if subset.empty:
+        return None, None, None, None
+    student_gpa = subset.groupby(['student sis', 'student name'], observed=True)['numeric_grade'].mean()
+    threshold = student_gpa.quantile(0.8 if group_type == 'top' else 0.2)
+    target = student_gpa[student_gpa >= threshold] if group_type == 'top' else student_gpa[student_gpa <= threshold]
+    target_ids = target.index.get_level_values('student sis')
+    group_data = subset[subset['student sis'].isin(target_ids)].copy()
+    stats_df = group_data.groupby('course', observed=True)['numeric_grade'].agg(
+        ['count', 'mean', 'std', 'min', 'max']
+    ).round(2).sort_values('mean', ascending=False)
+    student_summary = (
+        group_data.groupby(['student name', 'student sis'], observed=True)['numeric_grade']
+        .agg(**{'Average Grade': 'mean', 'Highest Grade': 'max', 'Lowest Grade': 'min'})
+        .reset_index().sort_values('Average Grade', ascending=(group_type != 'top'))
+    )
+    metrics = {
+        'count': int(target.groupby(level='student sis').size().shape[0]),
+        'avg_gpa': float(target.mean()), 'threshold': float(threshold)
+    }
+    return stats_df, student_summary, group_data, metrics
 
 # -----------------------------------------------------------------------------
 # 2. STATISTICS
@@ -339,7 +924,7 @@ def get_overview_metrics(df):
     """
     if df.empty: return {}
     total_students = df['student sis'].nunique()
-    strand_stats = df.groupby('strand')['numeric_grade'].agg(['mean', lambda x: (x>=75).mean()*100])
+    strand_stats = df.groupby('strand', observed=True)['numeric_grade'].agg(['mean', lambda x: (x>=75).mean()*100])
     strand_stats.columns = ['Avg', 'PassRate']
     return {"Total Students": f"{total_students:,}", "Strands": strand_stats.round(2).to_dict('index')}
 
@@ -378,7 +963,7 @@ def get_subgroup_statistics(df, school_year, grade, strand, group_type='top'):
     subset = df[(df['school_year'] == school_year) & (df['grade_level'] == grade) & (df['strand'] == strand)].copy()
     if len(subset) == 0: return None, None, None, None
 
-    student_gpa = subset.groupby(['student sis', 'student name'])['numeric_grade'].mean()
+    student_gpa = subset.groupby(['student sis', 'student name'], observed=True)['numeric_grade'].mean()
     if group_type == 'top':
         threshold = student_gpa.quantile(0.8)
         target_students = student_gpa[student_gpa >= threshold].index
@@ -389,7 +974,7 @@ def get_subgroup_statistics(df, school_year, grade, strand, group_type='top'):
     target_ids = [x[0] for x in target_students]
     group_data = subset[subset['student sis'].isin(target_ids)].copy()
     
-    stats_df = group_data.groupby('course')['numeric_grade'].agg(['count', 'mean', 'std', 'min', 'max']).round(2).sort_values('mean', ascending=False)
+    stats_df = group_data.groupby('course', observed=True)['numeric_grade'].agg(['count', 'mean', 'std', 'min', 'max']).round(2).sort_values('mean', ascending=False)
     
     def get_student_details(x):
         x = x.sort_values('numeric_grade')
@@ -402,7 +987,7 @@ def get_subgroup_statistics(df, school_year, grade, strand, group_type='top'):
             'Lowest Subject': x.iloc[0]['course']
         })
 
-    student_summary_df = group_data.groupby(['student name', 'student sis']).apply(get_student_details)
+    student_summary_df = group_data.groupby(['student name', 'student sis'], observed=True).apply(get_student_details)
     student_summary_df = student_summary_df.sort_values('Average Grade', ascending=(group_type != 'top'))
     student_summary_df = student_summary_df.reset_index(level='student sis', drop=True)[['Section', 'Average Grade', 'Highest Grade', 'Highest Subject', 'Lowest Grade', 'Lowest Subject']]
     
@@ -411,13 +996,11 @@ def get_subgroup_statistics(df, school_year, grade, strand, group_type='top'):
 
 
 def plot_subject_extremes_split(df, school_year=None):
-    """Render two bar charts showing the five highest- and five lowest-mean subjects per strand.
+    """Render two bar charts showing the five highest/lowest subjects per strand.
 
-    Subjects are ranked by their mean numeric grade within the selected school
-    year (or across all years when school_year is None).  Colour encoding
-    uses a sequential red gradient for low-performing subjects and a sequential
-    green gradient for high-performing subjects, with darker shades assigned
-    to the most extreme ranks.
+    Subjects are ranked by mean grade within each SHS strand.  The x-axis uses
+    labels such as ``STEM-A`` through ``STEM-E``; the full subject name is
+    available in the hover tooltip.
 
     Parameters
     ----------
@@ -442,10 +1025,9 @@ def plot_subject_extremes_split(df, school_year=None):
     clean_df = clean_df.dropna(subset=['numeric_grade', 'strand'])
     if clean_df.empty: return None, None
 
-    strands = sorted(clean_df['strand'].unique())
+    strands = sorted(clean_df['strand'].astype(str).unique())
     if not strands: return None, None
-
-    ranks = [1, 2, 3, 4, 5]
+    rank_count = 5
 
     # Darker shades assigned to rank 1 (most extreme) within each gradient.
     red_gradient   = ['#4d192b', '#872c4c', '#c13e6c', '#d37898', '#e6b2c4']
@@ -459,11 +1041,11 @@ def plot_subject_extremes_split(df, school_year=None):
     plot_data = []
 
     for strand in strands:
-        strand_data = clean_df[clean_df['strand'] == strand]
-        subj_stats = strand_data.groupby('course')['numeric_grade'].mean().reset_index()
+        strand_data = clean_df[clean_df['strand'].astype(str) == strand]
+        subj_stats = strand_data.groupby('course', observed=True)['numeric_grade'].mean().reset_index()
 
-        bottom_5 = subj_stats.sort_values('numeric_grade', ascending=True).head(len(ranks)).copy()
-        top_5    = subj_stats.sort_values('numeric_grade', ascending=False).head(len(ranks)).copy()
+        bottom_5 = subj_stats.sort_values('numeric_grade', ascending=True).head(rank_count).copy()
+        top_5    = subj_stats.sort_values('numeric_grade', ascending=False).head(rank_count).copy()
 
         bottom_5['strand'] = strand; bottom_5['Rank Type'] = 'Hardest'
         top_5['strand']    = strand; top_5['Rank Type']    = 'Easiest'
@@ -479,10 +1061,13 @@ def plot_subject_extremes_split(df, school_year=None):
         bottom_5['Color_Fill'] = bottom_5['Color_Solid'].apply(lambda x: hex_to_rgba(x, 0.5))
         top_5['Color_Fill']    = top_5['Color_Solid'].apply(lambda x: hex_to_rgba(x, 0.5))
 
-        # X-axis labels encode strand and rank (e.g., 'STEM-1') since the
-        # full subject name is available in the hover tooltip.
-        bottom_5['X_Label'] = bottom_5.apply(lambda r: f"{r['strand']}-{r['Display_Rank']}", axis=1)
-        top_5['X_Label']    = top_5.apply(lambda r: f"{r['strand']}-{r['Display_Rank']}", axis=1)
+        # X-axis labels encode strand and rank (e.g., STEM-A).
+        bottom_5['X_Label'] = bottom_5.apply(
+            lambda r: f"{r['strand']}-{chr(ord('A') + r['Display_Rank'] - 1)}", axis=1
+        )
+        top_5['X_Label'] = top_5.apply(
+            lambda r: f"{r['strand']}-{chr(ord('A') + r['Display_Rank'] - 1)}", axis=1
+        )
 
         bottom_5['Subject_Name'] = bottom_5['course']
         top_5['Subject_Name']    = top_5['course']
@@ -493,7 +1078,7 @@ def plot_subject_extremes_split(df, school_year=None):
     if not plot_data: return None, None
     plot_df = pd.DataFrame(plot_data)
 
-    order_map = {s: i for i, s in enumerate(strands)}
+    order_map = {strand: i for i, strand in enumerate(strands)}
     plot_df['Strand_Order'] = plot_df['strand'].map(order_map)
     plot_df = plot_df.sort_values(['Strand_Order', 'Rank Type', 'Display_Rank'], ascending=[True, False, True])
 
@@ -510,6 +1095,7 @@ def plot_subject_extremes_split(df, school_year=None):
             name='Hardest Subjects',
             text=hardest_df['numeric_grade'].apply(lambda x: f"{x:.1f}"),
             textposition='outside',
+            showlegend=False,
             customdata=np.column_stack((hardest_df['Subject_Name'], hardest_df['strand'])),
             hovertemplate="<b>%{customdata[0]}</b><br>Strand: %{customdata[1]}<br>Average: %{y:.1f}<extra></extra>"
         )
@@ -536,6 +1122,7 @@ def plot_subject_extremes_split(df, school_year=None):
             name='Easiest Subjects',
             text=easiest_df['numeric_grade'].apply(lambda x: f"{x:.1f}"),
             textposition='outside',
+            showlegend=False,
             customdata=np.column_stack((easiest_df['Subject_Name'], easiest_df['strand'])),
             hovertemplate="<b>%{customdata[0]}</b><br>Strand: %{customdata[1]}<br>Average: %{y:.1f}<extra></extra>"
         )
@@ -956,7 +1543,10 @@ def truncate_title(text, limit=25):
     """Truncates text to limit and adds '...' if longer."""
     return text if len(text) <= limit else text[:limit] + "..."
 
-def plot_pairwise_correlations_interactive(df, school_year, grade, strand, top_students=None, bottom_students=None):
+def plot_pairwise_correlations_interactive(
+    df, school_year, grade, strand, top_students=None, bottom_students=None,
+    school_level='SHS', period_label=None
+):
     """Render a paginated scatter grid of all pairwise subject correlations.
 
     Each subplot shows individual student grades on two subjects as a scatter
@@ -992,10 +1582,20 @@ def plot_pairwise_correlations_interactive(df, school_year, grade, strand, top_s
         (figures, status_message). figures is empty and message is descriptive
         if the cohort has insufficient data.
     """
-    subset = df[(df['school_year'] == school_year) & (df['grade_level'] == grade) & (df['strand'] == strand)].copy()
+    if school_level == 'JHS':
+        subset = df[
+            (df['school_level'] == 'JHS')
+            & (df['school_year'] == school_year)
+            & (df['grade_level'].astype(str) == str(grade))
+        ].copy()
+        if period_label is not None:
+            subset = subset[subset['period_label'] == period_label]
+        title_prefix = f"JHS: {school_year} - Grade {grade}"
+    else:
+        subset = df[(df['school_year'] == school_year) & (df['grade_level'] == grade) & (df['strand'] == strand)].copy()
+        title_prefix = f"All Students: {strand} - Grade {grade}"
     if len(subset) == 0: return [], "No Data"
-    
-    title_prefix = f"All Students: {strand} - Grade {grade}"
+
     if top_students is not None:
         subset = subset[subset['student sis'].isin(top_students)]
         title_prefix = f"Top 20%: {strand} - Grade {grade}"
@@ -1024,7 +1624,10 @@ def plot_pairwise_correlations_interactive(df, school_year, grade, strand, top_s
     else:
         dot_color = colors[0]
 
-    trend_color = '#FFFFFF'   # white trendline for contrast on dark background
+    # Mid-tone colours remain visible against both Streamlit light and dark
+    # themes.  A white trendline disappears when the app is rendered in light
+    # mode, while a near-black line is hard to see in dark mode.
+    trend_color = '#6B7280'
     green_zone = '#81C784'    # co-high-performance zone (both subjects ≥ 80)
     red_zone = '#E57373'      # co-low-performance zone  (both subjects ≤ 80)
     zone_opacity = 0.15       
@@ -1052,6 +1655,20 @@ def plot_pairwise_correlations_interactive(df, school_year, grade, strand, top_s
             col = (idx % n_cols) + 1
             pair_data = pivot_df[[s1, s2]].dropna().reset_index()
             
+            # Apply fixed grade-scale axes to every panel, including panels
+            # whose pairwise data are sparse.  Otherwise Plotly auto-ranges
+            # those panels and can expose values such as 55 and 105.
+            fig.update_xaxes(
+                range=[60, 100], dtick=5, showgrid=True,
+                gridcolor='rgba(128,128,128,0.25)', zeroline=False,
+                row=row, col=col
+            )
+            fig.update_yaxes(
+                range=[60, 100], dtick=5, showgrid=True,
+                gridcolor='rgba(128,128,128,0.25)', zeroline=False,
+                row=row, col=col
+            )
+
             if len(pair_data) > 0:
                 # Scatter
                 fig.add_trace(go.Scatter(
@@ -1079,10 +1696,6 @@ def plot_pairwise_correlations_interactive(df, school_year, grade, strand, top_s
                 fig.add_shape(type="rect", x0=80, y0=80, x1=100, y1=100, fillcolor=green_zone, opacity=zone_opacity, layer="below", line_width=0, row=row, col=col)
                 fig.add_shape(type="rect", x0=60, y0=60, x1=80, y1=80, fillcolor=red_zone, opacity=zone_opacity, layer="below", line_width=0, row=row, col=col)
                 
-                # AXES
-                fig.update_xaxes(range=[60, 100], row=row, col=col, dtick=5, showgrid=True, gridcolor='rgba(255,255,255,0.1)')
-                fig.update_yaxes(range=[60, 100], row=row, col=col, dtick=5, showgrid=True, gridcolor='rgba(255,255,255,0.1)', scaleanchor="x", scaleratio=1)
-
         fig.update_annotations(font_size=11)
 
         fig.update_layout(
@@ -1097,7 +1710,9 @@ def plot_pairwise_correlations_interactive(df, school_year, grade, strand, top_s
         
     return figures, "Success"
 
-def plot_correlation_heatmap_interactive(df, school_year, grade, strand):
+def plot_correlation_heatmap_interactive(
+    df, school_year, grade, strand, school_level='SHS', period_label=None
+):
     """Render an interactive Pearson correlation matrix heatmap.
 
     Computes pairwise Pearson product-moment correlations across all subjects
@@ -1122,9 +1737,20 @@ def plot_correlation_heatmap_interactive(df, school_year, grade, strand):
         (figure, status_message).  Figure is None when data is insufficient;
         the status_message describes the reason.
     """
-    subset = df[(df['school_year'] == school_year) &
-                (df['grade_level'] == grade) &
-                (df['strand'] == strand)].copy()
+    if school_level == 'JHS':
+        subset = df[
+            (df['school_level'] == 'JHS')
+            & (df['school_year'] == school_year)
+            & (df['grade_level'].astype(str) == str(grade))
+        ].copy()
+        if period_label is not None:
+            subset = subset[subset['period_label'] == period_label]
+        title = f"JHS Correlation Matrix: Grade {grade} ({school_year})"
+    else:
+        subset = df[(df['school_year'] == school_year) &
+                    (df['grade_level'] == grade) &
+                    (df['strand'] == strand)].copy()
+        title = f"Correlation Matrix: {strand} - Grade {grade} ({school_year})"
 
     if len(subset) == 0: return None, "No data available for the selected filters."
 
@@ -1146,7 +1772,7 @@ def plot_correlation_heatmap_interactive(df, school_year, grade, strand):
         color_continuous_scale="Purpor",
         zmin=-1, zmax=1,
         labels=dict(x="Subject", y="Subject", color="Correlation"),
-        title=f"Correlation Matrix: {strand} - Grade {grade} ({school_year})"
+        title=title
     )
 
     fig.update_layout(
@@ -1160,6 +1786,181 @@ def plot_correlation_heatmap_interactive(df, school_year, grade, strand):
 # -----------------------------------------------------------------------------
 # 5. STUDENT PROFILE ANALYSIS
 # -----------------------------------------------------------------------------
+
+def _jhs_annual_records(df):
+    """Return complete JHS annual subject records only."""
+    result = df.copy()
+    if 'school_level' in result.columns:
+        result = result[result['school_level'].eq('JHS')]
+    if 'period_type' in result.columns:
+        result = result[result['period_type'].eq('annual')]
+    complete = result.get('is_annual_complete', result['numeric_grade'].notna())
+    return result[complete].copy()
+
+
+def get_jhs_student_kpis(df, student_sis):
+    """Compute JHS-only profile KPIs from annual subject grades."""
+    annual = _jhs_annual_records(df)
+    student = annual[annual['student sis'] == student_sis].copy()
+    if student.empty:
+        return {}
+    latest = student.sort_values(['year_int', 'grade_level']).iloc[-1]
+    return {
+        'Name': latest['student name'], 'ID': student_sis,
+        'Grade': str(latest['grade_level']), 'Latest School Year': latest['school_year'],
+        'JHS GPA': round(student['numeric_grade'].mean(), 2),
+        'Latest Annual GPA': round(
+            student[student['school_year'] == latest['school_year']]['numeric_grade'].mean(), 2
+        ),
+        'Total Subjects Taken': int(student['course_key'].nunique()),
+        'Highest Grade': float(student['numeric_grade'].max()),
+        'Lowest Grade': float(student['numeric_grade'].min()),
+    }
+
+
+def calculate_jhs_class_standing(df, student_sis):
+    """Return JHS annual-GPA percentile within the student's latest cohort."""
+    annual = _jhs_annual_records(df)
+    student = annual[annual['student sis'] == student_sis]
+    if student.empty:
+        return 'N/A'
+    latest = student.sort_values(['year_int', 'grade_level']).iloc[-1]
+    cohort = annual[
+        (annual['school_year'] == latest['school_year'])
+        & (annual['grade_level'].astype(str) == str(latest['grade_level']))
+    ]
+    cohort_gpa = cohort.groupby('student sis', observed=True)['numeric_grade'].mean().dropna()
+    if len(cohort_gpa) < 2:
+        return 'N/A (Cohort too small)'
+    percentile = (cohort_gpa <= student['numeric_grade'].mean()).mean() * 100
+    # Keep the dashboard KPI compact. The value remains a percentile rank;
+    # the dashboard exposes that meaning through metric help text.
+    return f'{percentile:.1f}th'
+
+
+def plot_jhs_growth_curve(df, student_sis, grade_level=None, school_year=None):
+    """Plot one JHS grade-level trajectory against its cohort mean.
+
+    When ``grade_level`` is omitted, the student's latest available JHS grade
+    level is used.  When ``school_year`` is omitted, the latest school year in
+    that grade is used.  Restricting both traces to one grade and one school
+    year keeps the academic period axis readable and prevents trajectories
+    from different grade levels or years from appearing as one continuous
+    student line.
+    """
+    source = df.copy()
+    if 'school_level' in source.columns:
+        source = source[source['school_level'].eq('JHS')]
+    source = source[source['period_type'].eq('quarter')].dropna(subset=['numeric_grade'])
+    source['_year_sort'] = pd.to_numeric(
+        source.get('year_int', source['school_year'].astype(str).str[:4]),
+        errors='coerce'
+    )
+    student_all = source[source['student sis'] == student_sis]
+    if student_all.empty:
+        return go.Figure(layout=go.Layout(title='No JHS Data for Student'))
+
+    if grade_level is None:
+        latest_position = student_all.dropna(
+            subset=['grade_level', '_year_sort']
+        ).sort_values(['_year_sort', 'grade_level']).tail(1)
+        if not latest_position.empty:
+            grade_level = str(latest_position.iloc[0]['grade_level'])
+
+    if grade_level is not None:
+        source = source[source['grade_level'].astype(str) == str(grade_level)]
+
+    if source.empty:
+        return go.Figure(layout=go.Layout(title='No JHS Data for Selected Grade'))
+
+    student_in_grade = source[source['student sis'] == student_sis]
+    if student_in_grade.empty:
+        return go.Figure(layout=go.Layout(title='No JHS Data for Selected Grade'))
+
+    if school_year is None:
+        # Use the student's own latest year in this grade, not the latest year
+        # represented by the entire grade cohort.  This is important for Grade
+        # 10 graduates whose last attended year may precede the newest Grade
+        # 10 cohort in the corpus.
+        latest_student_year = student_in_grade['_year_sort'].max()
+        source = source[source['_year_sort'] == latest_student_year]
+        school_year = (
+            student_in_grade.loc[
+                student_in_grade['_year_sort'] == latest_student_year,
+                'school_year'
+            ].iloc[0]
+            if not student_in_grade.empty else None
+        )
+    else:
+        source = source[source['school_year'].astype(str) == str(school_year)]
+
+    student = source[source['student sis'] == student_sis]
+    if student.empty:
+        return go.Figure(layout=go.Layout(title='No JHS Data for Selected Grade and School Year'))
+    student_series = (
+        student.groupby(['school_year', 'grade_level', 'period_order'], as_index=False, observed=True)['numeric_grade']
+        .mean().sort_values(['school_year', 'grade_level', 'period_order'])
+    )
+    cohort_series = (
+        source.groupby(['school_year', 'grade_level', 'period_order'], as_index=False, observed=True)['numeric_grade']
+        .mean().sort_values(['school_year', 'grade_level', 'period_order'])
+    )
+    def period_labels(frame):
+        return frame['school_year'].astype(str) + ' G' + frame['grade_level'].astype(str) + ' Q' + frame['period_order'].astype(str)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=period_labels(cohort_series), y=cohort_series['numeric_grade'], mode='lines+markers',
+        name='JHS Cohort Mean', line=dict(color='#90A4AE', dash='dot', width=2),
+        hovertemplate='<b>%{x}</b><br>Cohort Mean: %{y:.2f}<extra></extra>'
+    ))
+    fig.add_trace(go.Scatter(
+        x=period_labels(student_series), y=student_series['numeric_grade'], mode='lines+markers',
+        name='Student', line=dict(color=px.colors.qualitative.Bold[0], width=3),
+        marker=dict(size=10), hovertemplate='<b>%{x}</b><br>Student Mean: %{y:.2f}<extra></extra>'
+    ))
+    fig.update_layout(
+        title=(
+            'JHS Quarterly Academic Trajectory'
+            + (f' — Grade {grade_level}' if grade_level is not None else '')
+            + (f' ({school_year})' if school_year is not None else '')
+        ), xaxis_title='Academic Period',
+        yaxis_title='Quarter Mean Grade', yaxis=dict(range=[60, 100]),
+        hovermode='x unified', legend=dict(orientation='h', y=1.02), margin=dict(t=80)
+    )
+    return fig
+
+
+def get_jhs_subject_performance_vs_peer(df, student_sis, period_label='Annual'):
+    """Compare each JHS annual/quarter subject grade with its peer mean."""
+    source = df.copy()
+    if 'school_level' in source.columns:
+        source = source[source['school_level'].eq('JHS')]
+    source = source[source['period_label'].eq(period_label)].dropna(subset=['numeric_grade'])
+    student = source[source['student sis'] == student_sis]
+    if student.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, row in student.iterrows():
+        peers = source[
+            (source['school_year'] == row['school_year'])
+            & (source['grade_level'].astype(str) == str(row['grade_level']))
+            & (source['course'] == row['course'])
+        ]
+        peer_average = peers['numeric_grade'].mean()
+        rows.append({
+            'Course': row['course'], 'Grade Level': row['grade_level'],
+            'School Year': row['school_year'], 'Student Grade': round(row['numeric_grade'], 1),
+            'Peer Average': round(peer_average, 1) if pd.notna(peer_average) else np.nan,
+            'Difference': round(row['numeric_grade'] - peer_average, 1) if pd.notna(peer_average) else 0,
+            'Strand': 'JHS'
+        })
+    return (
+        pd.DataFrame(rows)
+        .sort_values(['Course', 'School Year', 'Grade Level'], ascending=[True, False, False])
+        .drop_duplicates(subset=['Course'], keep='first')
+        .sort_values('Student Grade', ascending=False)
+        .reset_index(drop=True)
+    )
 
 def get_student_kpis(df, student_sis):
     """Compute summary KPIs for a single student across their full transcript.
@@ -1220,7 +2021,7 @@ def calculate_class_standing(df, student_sis):
     Returns
     -------
     str
-        Formatted percentile string (e.g., '72.4th Percentile'), or 'N/A'
+        Compact percentile-rank string (e.g., '72.4th'), or 'N/A'
         if the student is not found or the cohort is too small (< 2).
     """
     student_data = df[df['student sis'] == student_sis]
@@ -1235,14 +2036,16 @@ def calculate_class_standing(df, student_sis):
                    (df['grade_level'] == latest_grade) &
                    (df['school_year'] == latest_year)]
 
-    cohort_gpas = cohort_df.groupby('student sis')['numeric_grade'].mean().dropna()
+    cohort_gpas = cohort_df.groupby('student sis', observed=True)['numeric_grade'].mean().dropna()
     student_gpa = student_data['numeric_grade'].mean()
 
     # Proportion of cohort at or below this student's GPA, as a percentage.
     percentile = (cohort_gpas <= student_gpa).sum() / len(cohort_gpas) * 100
 
     if len(cohort_gpas) < 2: return "N/A (Cohort too small)"
-    return f"{percentile:.1f}th Percentile"
+    # Keep the dashboard KPI compact. The value remains a percentile rank;
+    # the dashboard exposes that meaning through metric help text.
+    return f"{percentile:.1f}th"
 
 def plot_growth_curve(df, student_sis):
     """Plot a student's semester GWA trajectory against all four strand baselines.
@@ -1271,21 +2074,36 @@ def plot_growth_curve(df, student_sis):
     -------
     plotly.graph_objects.Figure
     """
-    # 1. Get Student Data
-    student_data = df[df['student sis'] == student_sis].copy()
-    if student_data.empty: return go.Figure(go.Layout(title='No Data for Student'))
+    # 1. Get the student's academic SHS records. This function must retain
+    # the complete SHS trajectory; the one-grade/one-year restriction belongs
+    # only to the JHS trajectory function.
+    source = df.copy()
+    if 'school_level' in source.columns:
+        source = source[source['school_level'].eq('SHS')]
+    if 'is_academic_grade_record' in source.columns:
+        source = source[source['is_academic_grade_record'].fillna(False)]
+    source = source.dropna(subset=['numeric_grade', 'full_term']).copy()
+    source['_term_label'] = source['full_term'].astype(str)
 
     term_order = ['G11-S1', 'G11-S2', 'G12-S1', 'G12-S2']
+    source = source[source['_term_label'].isin(term_order)]
+    student_data = source[source['student sis'] == student_sis].copy()
+    if student_data.empty: return go.Figure(layout=go.Layout(title='No Data for Student'))
 
     # Aggregate student's mean grade per term, carrying school_year and
-    # grade_level forward so strand baselines can be matched precisely.
-    term_gpa = student_data.groupby('full_term').agg({
+    # grade_level forward so strand baselines can be matched precisely. These
+    # fields are constant within an academic term; ``first`` is intentional
+    # because the memory-compact corpus stores them as unordered categoricals,
+    # for which pandas cannot apply ``max``.
+    term_gpa = student_data.groupby('_term_label', observed=True).agg({
         'numeric_grade': 'mean',
-        'school_year': 'max',
-        'grade_level': 'max'
+        'school_year': 'first',
+        'grade_level': 'first'
     }).reset_index()
 
-    term_gpa['sort_order'] = term_gpa['full_term'].apply(lambda x: term_order.index(x) if x in term_order else 99)
+    term_gpa['sort_order'] = term_gpa['_term_label'].apply(
+        lambda x: term_order.index(x) if x in term_order else 99
+    )
     term_gpa = term_gpa.sort_values('sort_order').drop(columns='sort_order')
 
     # Compute cohort mean for each strand at each term the student attended.
@@ -1295,14 +2113,14 @@ def plot_growth_curve(df, student_sis):
     for _, row in term_gpa.iterrows():
         year  = row['school_year']
         grade = row['grade_level']
-        term  = row['full_term']
+        term  = row['_term_label']
 
         for s in strands_to_plot:
-            cohort = df[
-                (df['strand'] == s) &
-                (df['grade_level'] == grade) &
-                (df['school_year'] == year) &
-                (df['full_term'] == term)
+            cohort = source[
+                (source['strand'] == s) &
+                (source['grade_level'] == grade) &
+                (source['school_year'] == year) &
+                (source['_term_label'] == term)
             ]
             strand_data[s].append(cohort['numeric_grade'].mean() if not cohort.empty else None)
 
@@ -1320,7 +2138,7 @@ def plot_growth_curve(df, student_sis):
 
     for s in strands_to_plot:
         fig.add_trace(go.Scatter(
-            x=term_gpa['full_term'],
+            x=term_gpa['_term_label'],
             y=strand_data[s],
             mode='lines+markers',
             name=f'{s} Avg',
@@ -1331,7 +2149,7 @@ def plot_growth_curve(df, student_sis):
         ))
 
     fig.add_trace(go.Scatter(
-        x=term_gpa['full_term'],
+        x=term_gpa['_term_label'],
         y=term_gpa['numeric_grade'],
         mode='lines+markers',
         name='Student (You)',
@@ -1462,7 +2280,7 @@ def plot_subject_comparison_dumbbell(comparison_df):
     -------
     plotly.graph_objects.Figure
     """
-    if comparison_df.empty: return go.Figure(go.Layout(title='No Comparison Data'))
+    if comparison_df.empty: return go.Figure(layout=go.Layout(title='No Comparison Data'))
 
     comparison_df = comparison_df.sort_values('Student Grade', ascending=True)
 
@@ -1478,7 +2296,7 @@ def plot_subject_comparison_dumbbell(comparison_df):
         y=comparison_df['Course'],
         mode='lines',
         line=dict(color='grey', width=1.5),
-        showlegend=False,
+            showlegend=False,
         hoverinfo='none'
     ))
 
@@ -1544,7 +2362,7 @@ def plot_spider_graph(comparison_df):
     -------
     plotly.graph_objects.Figure
     """
-    if comparison_df.empty: return go.Figure(go.Layout(title='No Comparison Data'))
+    if comparison_df.empty: return go.Figure(layout=go.Layout(title='No Comparison Data'))
 
     plot_df = comparison_df.copy()
 
@@ -1643,6 +2461,12 @@ def plot_spider_graph(comparison_df):
 # flagged for intervention.  The same constant governs both the RF classifier
 # target label and the visual threshold line in the predictive charts.
 AT_RISK_THRESHOLD = 80
+
+# Stable semester encoding shared by training and inference. `term_order`
+# remains the four-position curriculum sequence (1..4); this mapping is the
+# separate semester-within-year feature used by the Random Forest pipelines.
+# Missing/unknown values remain NaN and are excluded from model training.
+SEMESTER_ENCODING = {'S1': 1, 'S2': 2}
  
 # ── Shared Helpers ────────────────────────────────────────────────────────────
  
@@ -1652,7 +2476,9 @@ def _encode_categoricals(df_in):
     LabelEncoder produces integer codes sorted alphabetically by category
     value.  For strand (ABM, GAS, HUMSS, STEM) the encoding is stable across
     calls on the same corpus because the full vocabulary is always present.
-    For semester (S0, S1, S2) the encoding is similarly stable.
+    Semester uses the explicit stable mapping S1=1, S2=2 so training and
+    inference share the same representation.  Unknown or missing semesters
+    remain NaN rather than being assigned a non-existent semester.
 
     This function also derives two numeric features used by both RF pipelines:
       • grade_int  : grade_level cast to int (11 or 12).
@@ -1674,8 +2500,10 @@ def _encode_categoricals(df_in):
     le_strand = LabelEncoder()
     le_sem    = LabelEncoder()
  
-    df['strand_enc']   = le_strand.fit_transform(df['strand'].fillna('STEM'))
-    df['semester_enc'] = le_sem.fit_transform(df['semester'].fillna('S1'))
+    df['strand_enc'] = le_strand.fit_transform(df['strand'].fillna('STEM'))
+    le_sem.fit(list(SEMESTER_ENCODING.keys()))
+    semester_values = df['semester'].astype('string').str.strip().str.upper()
+    df['semester_enc'] = semester_values.map(SEMESTER_ENCODING).astype(float)
     df['grade_int']    = pd.to_numeric(df['grade_level'], errors='coerce').fillna(11).astype(int)
     df['year_int']     = df['school_year'].str[:4].astype(int)
  
@@ -1736,9 +2564,18 @@ def build_macro_features(df):
     if df.empty:
         return pd.DataFrame()
 
+    source = (
+        df[df['is_academic_grade_record']].copy()
+        if 'is_academic_grade_record' in df.columns
+        else df.copy()
+    )
+    if 'school_level' in source.columns:
+        source = source[source['school_level'].eq('SHS')]
+
     # Aggregate to cohort level.
-    cohort = df.groupby(
-        ['school_year', 'semester', 'grade_level', 'strand', 'course']
+    cohort = source.groupby(
+        ['school_year', 'semester', 'grade_level', 'strand', 'course'],
+        observed=True
     ).agg(
         mean_grade = ('numeric_grade', 'mean'),
         std_grade  = ('numeric_grade', 'std'),
@@ -1755,13 +2592,13 @@ def build_macro_features(df):
     )
 
     # Lag features: previous semester's mean and spread for the same subject.
-    grp = cohort.groupby(['strand', 'grade_level', 'course'])
+    grp = cohort.groupby(['strand', 'grade_level', 'course'], observed=True)
     cohort['prior_mean'] = grp['mean_grade'].shift(1)
     cohort['prior_std']  = grp['std_grade'].shift(1)
 
     # Strand GWA: mean across ALL subjects for the same strand/grade/period.
     strand_gwa = (
-        df.groupby(['school_year', 'semester', 'grade_level', 'strand'])['numeric_grade']
+        source.groupby(['school_year', 'semester', 'grade_level', 'strand'], observed=True)['numeric_grade']
         .mean().reset_index()
         .rename(columns={'numeric_grade': 'strand_gwa'})
     )
@@ -1787,6 +2624,14 @@ MACRO_FEATURES = [
     'prior_mean', 'prior_std', 'std_grade',
     'n_students', 'skewness', 'strand_gwa'
 ]
+
+# Hosted-deployment bounds for the cohort-level forests. The model family and
+# temporal validation strategy are unchanged; capped trees avoid retaining a
+# large training footprint after the prediction page is visited.
+MACRO_RF_ESTIMATORS = 100
+MACRO_RF_MAX_DEPTH = 12
+MACRO_RF_MAX_LEAF_NODES = 128
+MACRO_RF_N_JOBS = 1
  
  
 def train_macro_model(df):
@@ -1797,11 +2642,10 @@ def train_macro_model(df):
     This mirrors the deployment scenario where the model is always predicting
     a future period it has not seen during training.
 
-    Regressor: RandomForestRegressor (200 trees, min_samples_leaf=3) targeting
-    mean_grade.
+    Regressor: bounded RandomForestRegressor targeting mean_grade.
 
-    Classifier: RandomForestClassifier (200 trees, min_samples_leaf=3,
-    class_weight='balanced') targeting at_risk.  class_weight='balanced'
+    Classifier: bounded RandomForestClassifier with class_weight='balanced'
+    targeting at_risk.  class_weight='balanced'
     prevents the majority class (on-track subjects) from dominating parameter
     updates when at-risk subjects are rare.
 
@@ -1833,37 +2677,54 @@ def train_macro_model(df):
     if len(train) < 10 or len(test) < 5:
         return None, None, {'error': 'Insufficient data after temporal split'}, pd.DataFrame()
  
-    X_tr, y_reg_tr = train[available], train['mean_grade']
-    X_te, y_reg_te = test[available],  test['mean_grade']
-    y_cls_tr, y_cls_te = train['at_risk'], test['at_risk']
- 
+    # Use compact model matrices and release the feature frame before fitting
+    # so the forest is not trained while the wide engineering frame remains
+    # resident in memory.
+    X_tr = train[available].to_numpy(dtype=np.float32, copy=True)
+    X_te = test[available].to_numpy(dtype=np.float32, copy=True)
+    y_reg_tr = train['mean_grade'].to_numpy(dtype=np.float32, copy=True)
+    y_reg_te = test['mean_grade'].to_numpy(dtype=np.float32, copy=True)
+    y_cls_tr = train['at_risk'].to_numpy(copy=True)
+    y_cls_te = test['at_risk'].to_numpy(copy=True)
+    train_n, test_n = len(train), len(test)
+    del cohort, train, test
+
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
- 
+
         reg = RandomForestRegressor(
-            n_estimators=200, min_samples_leaf=3,
-            random_state=42, n_jobs=-1
+            n_estimators=MACRO_RF_ESTIMATORS,
+            min_samples_leaf=3,
+            max_depth=MACRO_RF_MAX_DEPTH,
+            max_leaf_nodes=MACRO_RF_MAX_LEAF_NODES,
+            random_state=42,
+            n_jobs=MACRO_RF_N_JOBS
         )
         reg.fit(X_tr, y_reg_tr)
         reg_preds = reg.predict(X_te)
  
         cls = RandomForestClassifier(
-            n_estimators=200, min_samples_leaf=3,
-            class_weight='balanced', random_state=42, n_jobs=-1
+            n_estimators=MACRO_RF_ESTIMATORS,
+            min_samples_leaf=3,
+            max_depth=MACRO_RF_MAX_DEPTH,
+            max_leaf_nodes=MACRO_RF_MAX_LEAF_NODES,
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=MACRO_RF_N_JOBS
         )
         cls.fit(X_tr, y_cls_tr)
         cls_proba = cls.predict_proba(X_te)[:, 1]
  
     auc_val = (
         round(roc_auc_score(y_cls_te, cls_proba), 3)
-        if y_cls_te.nunique() > 1 else 'N/A'
+        if np.unique(y_cls_te).size > 1 else 'N/A'
     )
     val_metrics = {
         'MAE':     round(mean_absolute_error(y_reg_te, reg_preds), 3),
         'R2':      round(r2_score(y_reg_te, reg_preds), 3),
         'AUC':     auc_val,
-        'train_n': len(train),
-        'test_n':  len(test)
+        'train_n': train_n,
+        'test_n':  test_n
     }
  
     fi_df = pd.DataFrame({
@@ -1884,9 +2745,9 @@ def predict_macro_outlook(reg, cls, df, strand, grade_level, next_semester, next
     projected term.
 
     Risk labels:
-        🔴 High Risk  : at-risk probability >= 0.60
-        🟡 Moderate   : 0.35 <= probability < 0.60
-        🟢 On Track   : probability < 0.35
+        🔴 High Risk  : at-risk score >= 0.60
+        🟡 Moderate   : 0.35 <= score < 0.60
+        🟢 On Track   : score < 0.35
 
     Parameters
     ----------
@@ -1919,7 +2780,10 @@ def predict_macro_outlook(reg, cls, df, strand, grade_level, next_semester, next
     subset = cohort[
         (cohort['strand'] == strand) &
         (cohort['grade_level'] == grade_level)
-    ].sort_values('year_int', ascending=False)
+    ].sort_values(
+        ['year_int', 'semester_enc'],
+        ascending=[False, False]
+    )
 
     if subset.empty:
         return pd.DataFrame()
@@ -1929,7 +2793,7 @@ def predict_macro_outlook(reg, cls, df, strand, grade_level, next_semester, next
 
     # Advance time-encoding to the target prediction period.
     latest['year_int']     = int(next_year_str[:4])
-    latest['semester_enc'] = {'S1': 1, 'S2': 2}.get(next_semester, 1)
+    latest['semester_enc'] = SEMESTER_ENCODING.get(next_semester, np.nan)
     # Current actual mean becomes the lag feature for the projected semester.
     latest['prior_mean']   = latest['mean_grade']
     latest['prior_std']    = latest['std_grade']
@@ -1960,14 +2824,14 @@ def build_micro_features(df):
 
     Academic trajectory features (student-level, time-ordered):
         prior_gwa      : student's mean grade across all subjects in the
-                         immediately preceding academic term (groupby shift(1)
-                         on term GWA sorted by year_int and term_order).
-        cumulative_gwa : student's expanding mean across all prior records
-                         (shift(1) of the expanding window ensures the target
-                         record is not included in its own baseline).
-        gwa_trend      : linear slope of the student's per-term GWA sequence
-                         (computed via np.polyfit; returns 0.0 for students
-                         with only one observed term).
+                         immediately preceding academic term. It is computed
+                         once per student-term, then merged back to records.
+        cumulative_gwa : mean of the student's prior term GWAs only. It is
+                         computed at term level so subjects in the same term
+                         cannot change one another's history.
+        gwa_trend      : linear slope over the student's prior term GWA
+                         sequence only; 0.0 when fewer than two prior terms
+                         exist.
 
     Subject difficulty features (strand × grade × course aggregates):
         subj_hist_mean : historical mean grade for this subject in this strand
@@ -2006,10 +2870,14 @@ def build_micro_features(df):
         return pd.DataFrame()
 
     feat = df.copy()
+    if 'school_level' in feat.columns:
+        feat = feat[feat['school_level'].eq('SHS')].copy()
+        if feat.empty:
+            return pd.DataFrame()
     feat, _, _ = _encode_categoricals(feat)
     feat['term_order'] = feat['full_term'].map(
         {'G11-S1': 1, 'G11-S2': 2, 'G12-S1': 3, 'G12-S2': 4}
-    ).astype(float).fillna(0).astype(int)
+    ).astype(float)
 
     # Sort column selection — uses year_int+term_order when available for
     # precise chronological ordering; falls back to school_year+full_term.
@@ -2018,54 +2886,75 @@ def build_micro_features(df):
     else:
         sort_cols = ['student sis', 'school_year', 'full_term']
 
-    # Include sort columns in the groupby key set to preserve them after
-    # aggregation (pandas drops non-aggregated columns in groupby results).
-    group_keys = list(dict.fromkeys(['student sis', 'school_year', 'full_term'] + sort_cols))
-
+    # ── Student term history ───────────────────────────────────────────────
+    # Build one history row per student-term.  Explicit observed=True avoids
+    # materialising unused categorical combinations.  Computing at term level
+    # also prevents subject order within a term from changing the trajectory
+    # features of another subject in that same term.
+    term_keys = ['student sis', 'school_year', 'full_term', 'year_int', 'term_order']
+    history_source = (
+        feat[feat['is_academic_grade_record']]
+        if 'is_academic_grade_record' in feat.columns
+        else feat
+    )
+    aggregate_source = (
+        df[df['is_academic_grade_record']]
+        if 'is_academic_grade_record' in df.columns
+        else df
+    )
+    if 'school_level' in aggregate_source.columns:
+        aggregate_source = aggregate_source[aggregate_source['school_level'].eq('SHS')]
     term_gwa = (
-        feat.groupby(group_keys)['numeric_grade']
-        .mean().reset_index().rename(columns={'numeric_grade': 'term_gwa'})
-        .sort_values(sort_cols)
+        history_source.dropna(subset=['student sis', 'year_int', 'term_order', 'numeric_grade'])
+        .groupby(term_keys, observed=True, as_index=False)['numeric_grade']
+        .mean()
+        .rename(columns={'numeric_grade': 'term_gwa'})
+        .sort_values(['student sis', 'year_int', 'term_order'])
     )
 
-    term_gwa['prior_gwa'] = term_gwa.groupby('student sis')['term_gwa'].shift(1)
+    term_gwa['prior_gwa'] = (
+        term_gwa.groupby('student sis', sort=False, observed=True)['term_gwa'].shift(1)
+    )
+    term_gwa['cumulative_gwa'] = (
+        term_gwa.groupby('student sis', sort=False, observed=True)['term_gwa']
+        .transform(lambda s: s.shift(1).expanding().mean())
+    )
+
+    # Trend available before each term, rather than one full-history value
+    # copied to every row.
+    term_gwa['gwa_trend'] = 0.0
+    for _, idx in term_gwa.groupby('student sis', sort=False, observed=True).groups.items():
+        values = term_gwa.loc[idx, 'term_gwa'].to_numpy()
+        trend_values = []
+        for position in range(len(values)):
+            prior_values = values[:position]
+            if len(prior_values) < 2:
+                trend_values.append(0.0)
+            else:
+                trend_values.append(float(
+                    np.polyfit(np.arange(len(prior_values)), prior_values, 1)[0]
+                ))
+        term_gwa.loc[idx, 'gwa_trend'] = trend_values
 
     feat = feat.merge(
-        term_gwa[['student sis', 'school_year', 'full_term', 'prior_gwa']],
-        on=['student sis', 'school_year', 'full_term'], how='left'
+        term_gwa[
+            ['student sis', 'school_year', 'full_term',
+             'prior_gwa', 'cumulative_gwa', 'gwa_trend']
+        ],
+        on=['student sis', 'school_year', 'full_term'],
+        how='left',
+        validate='many_to_one'
     )
- 
-    # ── Cumulative GWA ──────────────────────────────────────────────────────
-    feat = feat.sort_values(sort_cols)
-    feat['cumulative_gwa'] = (
-        feat.groupby('student sis')['numeric_grade']
-        .expanding().mean().shift(1)
-        .reset_index(level=0, drop=True)
-    )
-
-    def _slope(series):
-        """Return the least-squares linear slope of a term-GWA sequence."""
-        vals = series.dropna().values
-        if len(vals) < 2:
-            return 0.0
-        return float(np.polyfit(np.arange(len(vals)), vals, 1)[0])
-
-    gwa_trends = (
-        term_gwa.groupby('student sis')['term_gwa']
-        .apply(_slope).reset_index()
-        .rename(columns={'term_gwa': 'gwa_trend'})
-    )
-    feat = feat.merge(gwa_trends, on='student sis', how='left')
 
     # Subject difficulty baseline: historical mean, std, and skewness for
     # each strand × grade_level × course combination across all school years.
     subj_hist = (
-        df.groupby(['strand', 'grade_level', 'course'])['numeric_grade']
+        aggregate_source.groupby(['strand', 'grade_level', 'course'], observed=True)['numeric_grade']
         .agg(['mean', 'std']).reset_index()
         .rename(columns={'mean': 'subj_hist_mean', 'std': 'subj_hist_std'})
     )
     subj_skew = (
-        df.groupby(['strand', 'grade_level', 'course'])['numeric_grade']
+        aggregate_source.groupby(['strand', 'grade_level', 'course'], observed=True)['numeric_grade']
         .apply(lambda x: stats.skew(x.dropna()) if len(x.dropna()) > 2 else 0.0)
         .reset_index().rename(columns={'numeric_grade': 'subj_skewness'})
     )
@@ -2075,7 +2964,10 @@ def build_micro_features(df):
     # Peer mean: exact cohort reference for this subject, strand, grade,
     # semester, and school year.
     peer_mean = (
-        df.groupby(['school_year', 'semester', 'grade_level', 'strand', 'course'])
+        aggregate_source.groupby(
+            ['school_year', 'semester', 'grade_level', 'strand', 'course'],
+            observed=True
+        )
         ['numeric_grade'].mean().reset_index()
         .rename(columns={'numeric_grade': 'peer_mean'})
     )
@@ -2107,6 +2999,16 @@ MICRO_FEATURES = [
     'prior_gwa', 'cumulative_gwa', 'gwa_trend',
     'subj_hist_mean', 'subj_hist_std', 'subj_skewness', 'peer_mean'
 ]
+
+# Resource-conscious micro-model settings.  The previous 300-tree regressor
+# plus 300-tree classifier reached approximately 916 MiB peak RSS on the
+# production-sized SHS corpus.  These bounded trees retain the same RF model
+# family and temporal validation design while keeping the first-build footprint
+# comfortably below the lower Community Cloud memory tier.
+MICRO_RF_ESTIMATORS = 80
+MICRO_RF_MAX_DEPTH = 10
+MICRO_RF_MAX_LEAF_NODES = 96
+MICRO_RF_N_JOBS = 1
  
  
 def train_micro_model(df):
@@ -2117,12 +3019,13 @@ def train_micro_model(df):
     holdout strategy as train_macro_model(): all years except the most recent
     form the training set; the most recent year is the test set.
 
-    Regressor: RandomForestRegressor (300 trees, min_samples_leaf=5).
-    A higher tree count and larger leaf size are used compared to the macro
-    model because the micro dataset is substantially larger and more noisy.
+    Regressor/classifier: bounded Random Forests using the module-level
+    ``MICRO_RF_*`` settings.  The model remains intentionally approximate for
+    administrative prioritisation, but its tree growth is capped for hosted
+    deployment reliability.
 
-    Classifier: RandomForestClassifier (300 trees, min_samples_leaf=5,
-    class_weight='balanced') targeting at_risk (grade < AT_RISK_THRESHOLD).
+    The classifier uses ``class_weight='balanced'`` and targets at-risk
+    (grade < AT_RISK_THRESHOLD).
 
     Parameters
     ----------
@@ -2140,6 +3043,8 @@ def train_micro_model(df):
         return None, None, {'error': 'Insufficient student data'}, pd.DataFrame()
  
     available = [f for f in MICRO_FEATURES if f in feat.columns]
+    if 'is_academic_grade_record' in feat.columns:
+        feat = feat[feat['is_academic_grade_record']]
     clean     = feat.dropna(subset=available + ['numeric_grade'])
  
     latest_year = clean['year_int'].max()
@@ -2149,37 +3054,54 @@ def train_micro_model(df):
     if len(train) < 20 or len(test) < 10:
         return None, None, {'error': 'Insufficient data after temporal split'}, pd.DataFrame()
  
-    X_tr, y_reg_tr = train[available], train['numeric_grade']
-    X_te, y_reg_te = test[available],  test['numeric_grade']
-    y_cls_tr, y_cls_te = train['at_risk'], test['at_risk']
- 
+    # Materialise only the model matrices before fitting.  Converting to
+    # float32 and releasing the feature DataFrame avoids retaining the wide
+    # engineering frame alongside the forest objects.
+    X_tr = train[available].to_numpy(dtype=np.float32, copy=True)
+    X_te = test[available].to_numpy(dtype=np.float32, copy=True)
+    y_reg_tr = train['numeric_grade'].to_numpy(dtype=np.float32, copy=True)
+    y_reg_te = test['numeric_grade'].to_numpy(dtype=np.float32, copy=True)
+    y_cls_tr = train['at_risk'].to_numpy(copy=True)
+    y_cls_te = test['at_risk'].to_numpy(copy=True)
+    train_n, test_n = len(train), len(test)
+    del feat, clean, train, test
+
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
- 
+
         reg = RandomForestRegressor(
-            n_estimators=300, min_samples_leaf=5,
-            random_state=42, n_jobs=-1
+            n_estimators=MICRO_RF_ESTIMATORS,
+            min_samples_leaf=5,
+            max_depth=MICRO_RF_MAX_DEPTH,
+            max_leaf_nodes=MICRO_RF_MAX_LEAF_NODES,
+            random_state=42,
+            n_jobs=MICRO_RF_N_JOBS
         )
         reg.fit(X_tr, y_reg_tr)
         reg_preds = reg.predict(X_te)
  
         cls = RandomForestClassifier(
-            n_estimators=300, min_samples_leaf=5,
-            class_weight='balanced', random_state=42, n_jobs=-1
+            n_estimators=MICRO_RF_ESTIMATORS,
+            min_samples_leaf=5,
+            max_depth=MICRO_RF_MAX_DEPTH,
+            max_leaf_nodes=MICRO_RF_MAX_LEAF_NODES,
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=MICRO_RF_N_JOBS
         )
         cls.fit(X_tr, y_cls_tr)
         cls_proba = cls.predict_proba(X_te)[:, 1]
  
     auc_val = (
         round(roc_auc_score(y_cls_te, cls_proba), 3)
-        if y_cls_te.nunique() > 1 else 'N/A'
+        if np.unique(y_cls_te).size > 1 else 'N/A'
     )
     val_metrics = {
         'MAE':     round(mean_absolute_error(y_reg_te, reg_preds), 3),
         'R2':      round(r2_score(y_reg_te, reg_preds), 3),
         'AUC':     auc_val,
-        'train_n': len(train),
-        'test_n':  len(test)
+        'train_n': train_n,
+        'test_n':  test_n
     }
  
     fi_df = pd.DataFrame({
@@ -2188,6 +3110,265 @@ def train_micro_model(df):
     }).sort_values('Importance', ascending=False)
 
     return reg, cls, val_metrics, fi_df
+
+
+JHS_FEATURES = [
+    'grade_int', 'quarter_order', 'year_int',
+    'prior_gwa', 'cumulative_gwa', 'gwa_trend',
+    'subj_hist_mean', 'subj_hist_std', 'subj_skewness', 'peer_mean'
+]
+
+JHS_RF_ESTIMATORS = 100
+JHS_RF_MAX_DEPTH = 12
+JHS_RF_MAX_LEAF_NODES = 128
+JHS_RF_N_JOBS = 1
+
+
+def build_jhs_features(df):
+    """Build quarter-aware student/subject features for the JHS RF model."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    source = df.copy()
+    if 'school_level' in source.columns:
+        source = source[source['school_level'].eq('JHS')]
+    if 'period_type' in source.columns:
+        source = source[source['period_type'].eq('quarter')]
+    source = source[source['is_academic_grade_record']].copy()
+    source['numeric_grade'] = pd.to_numeric(source['numeric_grade'], errors='coerce')
+    source = source.dropna(subset=['student sis', 'school_year', 'grade_level', 'course', 'numeric_grade'])
+    if source.empty:
+        return pd.DataFrame()
+
+    source['year_int'] = pd.to_numeric(
+        source.get('year_int', source['school_year'].str[:4]), errors='coerce'
+    )
+    source['grade_int'] = pd.to_numeric(source['grade_level'], errors='coerce')
+    source['quarter_order'] = source['period_label'].map(
+        {label: idx for idx, label in enumerate(JHS_PERIOD_LABELS, start=1)}
+    ).astype(float)
+    source = source.dropna(subset=['year_int', 'grade_int', 'quarter_order'])
+
+    # One row per student/course/year/quarter is the model unit.
+    keys = ['student sis', 'student name', 'school_year', 'year_int',
+            'grade_level', 'grade_int', 'period_label', 'quarter_order', 'course', 'course_key']
+    source = source.groupby(
+        keys, as_index=False, dropna=False, observed=True
+    )['numeric_grade'].mean()
+
+    term_keys = ['student sis', 'school_year', 'year_int', 'grade_int', 'quarter_order']
+    term_gwa = (
+        source.groupby(term_keys, as_index=False, observed=True)['numeric_grade'].mean()
+        .rename(columns={'numeric_grade': 'term_gwa'})
+        .sort_values(['student sis', 'year_int', 'grade_int', 'quarter_order'])
+    )
+    term_gwa['prior_gwa'] = term_gwa.groupby(
+        'student sis', observed=True
+    )['term_gwa'].shift(1)
+    term_gwa['cumulative_gwa'] = (
+        term_gwa.groupby('student sis', observed=True)['term_gwa']
+        .transform(lambda values: values.shift(1).expanding().mean())
+    )
+    term_gwa['gwa_trend'] = 0.0
+    for student_id, indices in term_gwa.groupby(
+        'student sis', sort=False, observed=True
+    ).groups.items():
+        values = term_gwa.loc[indices, 'term_gwa'].to_numpy()
+        trend = []
+        for position in range(len(values)):
+            prior = values[:position]
+            trend.append(float(np.polyfit(np.arange(len(prior)), prior, 1)[0]) if len(prior) >= 2 else 0.0)
+        term_gwa.loc[indices, 'gwa_trend'] = trend
+
+    source = source.merge(
+        term_gwa[term_keys + ['prior_gwa', 'cumulative_gwa', 'gwa_trend']],
+        on=term_keys, how='left', validate='many_to_one'
+    )
+
+    subject_hist = (
+        source.groupby(['grade_level', 'course'], observed=True)['numeric_grade']
+        .agg(subj_hist_mean='mean', subj_hist_std='std')
+        .reset_index()
+    )
+    subject_skew = (
+        source.groupby(['grade_level', 'course'], observed=True)['numeric_grade']
+        .apply(lambda values: stats.skew(values) if len(values) > 2 else 0.0)
+        .reset_index(name='subj_skewness')
+    )
+    source = source.merge(subject_hist, on=['grade_level', 'course'], how='left')
+    source = source.merge(subject_skew, on=['grade_level', 'course'], how='left')
+
+    # Leave-one-out peer mean prevents the student's target grade from being
+    # the only source of the peer feature in small cohorts.
+    peer_keys = ['school_year', 'grade_level', 'period_label', 'course']
+    peer_stats = source.groupby(peer_keys, observed=True)['numeric_grade'].agg(['sum', 'count']).reset_index()
+    source = source.merge(peer_stats, on=peer_keys, how='left')
+    source['peer_mean'] = np.where(
+        source['count'] > 1,
+        (source['sum'] - source['numeric_grade']) / (source['count'] - 1),
+        source['sum'] / source['count']
+    )
+    source = source.drop(columns=['sum', 'count'])
+    for col in JHS_FEATURES:
+        if col in source.columns:
+            source[col] = source[col].replace([np.inf, -np.inf], np.nan)
+            source[col] = source[col].fillna(source[col].median())
+    source['at_risk'] = (source['numeric_grade'] < AT_RISK_THRESHOLD).astype(int)
+    return source.reset_index(drop=True)
+
+
+def train_jhs_model(df):
+    """Train separate JHS quarter-grade regression and at-risk RF models."""
+    feat = build_jhs_features(df)
+    if feat.empty or len(feat) < 50:
+        return None, None, {'error': 'Insufficient JHS student data'}, pd.DataFrame()
+    available = [feature for feature in JHS_FEATURES if feature in feat.columns]
+    clean = feat.dropna(subset=available + ['numeric_grade'])
+    latest_year = clean['year_int'].max()
+    train = clean[clean['year_int'] < latest_year]
+    test = clean[clean['year_int'] == latest_year]
+    if len(train) < 20 or len(test) < 10:
+        return None, None, {'error': 'Insufficient JHS data after temporal split'}, pd.DataFrame()
+
+    X_train = train[available].to_numpy(dtype=np.float32, copy=True)
+    y_train = train['numeric_grade'].to_numpy(dtype=np.float32, copy=True)
+    X_test = test[available].to_numpy(dtype=np.float32, copy=True)
+    y_test = test['numeric_grade'].to_numpy(dtype=np.float32, copy=True)
+    y_cls_train = train['at_risk'].to_numpy(copy=True)
+    y_cls_test = test['at_risk'].to_numpy(copy=True)
+    train_n, test_n = len(train), len(test)
+    del feat, clean, train, test
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        reg = RandomForestRegressor(
+            n_estimators=JHS_RF_ESTIMATORS,
+            min_samples_leaf=5,
+            max_depth=JHS_RF_MAX_DEPTH,
+            max_leaf_nodes=JHS_RF_MAX_LEAF_NODES,
+            random_state=42,
+            n_jobs=JHS_RF_N_JOBS
+        )
+        reg.fit(X_train, y_train)
+        reg_pred = reg.predict(X_test)
+        cls = RandomForestClassifier(
+            n_estimators=JHS_RF_ESTIMATORS,
+            min_samples_leaf=5,
+            max_depth=JHS_RF_MAX_DEPTH,
+            max_leaf_nodes=JHS_RF_MAX_LEAF_NODES,
+            class_weight='balanced',
+            random_state=42,
+            n_jobs=JHS_RF_N_JOBS
+        )
+        cls.fit(X_train, y_cls_train)
+        cls_prob = cls.predict_proba(X_test)[:, 1]
+    metrics = {
+        'MAE': round(mean_absolute_error(y_test, reg_pred), 3),
+        'R2': round(r2_score(y_test, reg_pred), 3),
+        'AUC': round(roc_auc_score(y_cls_test, cls_prob), 3)
+        if np.unique(y_cls_test).size > 1 else 'N/A',
+        'train_n': train_n, 'test_n': test_n
+    }
+    fi = pd.DataFrame({'Feature': available, 'Importance': reg.feature_importances_})\
+        .sort_values('Importance', ascending=False)
+    return reg, cls, metrics, fi
+
+
+def predict_jhs_outlook(jhs_reg, jhs_cls, df, student_sis):
+    """Predict the next JHS quarter for a student with an observed next period."""
+    if jhs_reg is None or jhs_cls is None:
+        return pd.DataFrame()
+    feat = build_jhs_features(df)
+    student = feat[feat['student sis'] == student_sis].copy()
+    if student.empty:
+        return pd.DataFrame()
+    latest = student.sort_values(['year_int', 'grade_int', 'quarter_order']).iloc[-1]
+    target_order = int(latest['quarter_order']) + 1
+    if target_order > 4:
+        return pd.DataFrame()
+    current = student[
+        (student['year_int'] == latest['year_int'])
+        & (student['grade_int'] == latest['grade_int'])
+        & (student['quarter_order'] == latest['quarter_order'])
+    ].copy()
+    if current.empty:
+        return pd.DataFrame()
+    current_term_mean = current['numeric_grade'].mean()
+    historical_term = student.groupby(
+        ['year_int', 'grade_int', 'quarter_order'], observed=True
+    )['numeric_grade'].mean()
+    current['prior_gwa'] = current_term_mean
+    current['cumulative_gwa'] = historical_term.mean()
+    current['quarter_order'] = target_order
+    available = [feature for feature in JHS_FEATURES if feature in current.columns]
+    X = current[available].fillna(current[available].median()).fillna(85.0)
+    current['predicted_grade'] = jhs_reg.predict(X).round(2)
+    current['risk_probability'] = jhs_cls.predict_proba(X)[:, 1].round(3)
+    current['risk_label'] = current['risk_probability'].apply(
+        lambda p: '🔴 High Risk' if p >= 0.6 else ('🟡 Moderate' if p >= 0.35 else '🟢 On Track')
+    )
+    current['numeric_grade'] = np.nan
+    current['target_period'] = f"Q{target_order}"
+    return current[[
+        'course', 'numeric_grade', 'predicted_grade', 'risk_probability',
+        'risk_label', 'peer_mean', 'target_period'
+    ]].sort_values('risk_probability', ascending=False).reset_index(drop=True)
+
+
+def predict_jhs_cohort_outlook(jhs_reg, jhs_cls, df, grade, target_quarter):
+    """Produce an administrative JHS subject outlook for a target quarter.
+
+    The prediction baseline is the immediately preceding quarter.  ``Q1`` is
+    treated as the first quarter of the next school-year cycle, so it uses the
+    latest available ``Q4`` records and advances ``year_int`` by one.  This
+    prevents a Q1 forecast from using same-quarter Q1 records as its baseline.
+    The student-level model is applied to every student in the baseline
+    quarter, then predictions and risk scores are averaged by subject so the
+    returned rows represent cohort-level subjects rather than one arbitrary
+    student record.
+    """
+    if jhs_reg is None or jhs_cls is None:
+        return pd.DataFrame()
+    feat = build_jhs_features(df)
+    target_order = int(str(target_quarter).replace('Q', ''))
+    source = feat[feat['grade_int'] == int(grade)].copy()
+    if source.empty:
+        return pd.DataFrame()
+    latest_year = source['year_int'].max()
+    source = source[source['year_int'] == latest_year]
+    baseline_order = 4 if target_order == 1 else target_order - 1
+    target_year = latest_year + 1 if target_order == 1 else latest_year
+    prior = source[source['quarter_order'] == baseline_order].copy()
+    if prior.empty:
+        # Handle a partially loaded latest year without reverting to the
+        # target quarter itself.  The latest available quarter is the safest
+        # administrative fallback for the requested projection. Keep every
+        # student in that quarter so the subject result remains aggregated.
+        fallback_order = source['quarter_order'].max()
+        prior = source[source['quarter_order'] == fallback_order].copy()
+    baseline = prior.copy()
+    baseline['quarter_order'] = target_order
+    baseline['year_int'] = target_year
+    available = [feature for feature in JHS_FEATURES if feature in baseline.columns]
+    X = baseline[available].fillna(baseline[available].median()).fillna(85.0)
+    baseline['predicted_grade'] = jhs_reg.predict(X)
+    baseline['risk_probability'] = jhs_cls.predict_proba(X)[:, 1]
+
+    # Convert student-level inference into one cohort-level row per subject.
+    # Averaging the leave-one-out peer means preserves the existing peer
+    # reference while avoiding an arbitrary last-row selection.
+    baseline = baseline.groupby('course', as_index=False, observed=True).agg(
+        predicted_grade=('predicted_grade', 'mean'),
+        risk_probability=('risk_probability', 'mean'),
+        peer_mean=('peer_mean', 'mean')
+    )
+    baseline['predicted_grade'] = baseline['predicted_grade'].round(2)
+    baseline['risk_probability'] = baseline['risk_probability'].round(3)
+    baseline['risk_label'] = baseline['risk_probability'].apply(
+        lambda p: '🔴 High Risk' if p >= 0.6 else ('🟡 Moderate' if p >= 0.35 else '🟢 On Track')
+    )
+    baseline['target_period'] = f"Q{target_order}"
+    return baseline[[
+        'course', 'predicted_grade', 'risk_probability', 'risk_label', 'peer_mean', 'target_period'
+    ]].sort_values('predicted_grade').reset_index(drop=True)
 
 
 def predict_student_outlook(micro_reg, micro_cls, df, student_sis):
@@ -2225,18 +3406,37 @@ def predict_student_outlook(micro_reg, micro_cls, df, student_sis):
     if student.empty:
         return pd.DataFrame()
  
-    latest = student.sort_values(['year_int', 'term_order']).iloc[-1]
-    current = student[
-        (student['school_year'] == latest['school_year']) &
-        (student['full_term']   == latest['full_term'])
+    # Invalid/support rows have NaN term_order and sort last by default.  If
+    # selected as "latest", they produce an empty current-term matrix and stop
+    # the whole Student Profile page before Future Term Forecast can render.
+    position_source = student.copy()
+    if 'record_type' in position_source.columns:
+        position_source = position_source[position_source['record_type'].eq('academic')]
+    position_source = position_source.dropna(subset=['year_int', 'term_order'])
+    if position_source.empty:
+        return pd.DataFrame()
+
+    latest = position_source.sort_values(['year_int', 'term_order']).iloc[-1]
+    current = position_source[
+        (position_source['year_int'] == latest['year_int']) &
+        (position_source['term_order'] == latest['term_order'])
     ].copy()
+    if current.empty:
+        return pd.DataFrame()
  
     available = [f for f in MICRO_FEATURES if f in current.columns]
-    X = current[available].fillna(current[available].median())
+    X = current[available].copy()
+    for col in available:
+        median = X[col].median()
+        X[col] = X[col].fillna(median if pd.notna(median) else 85.0)
  
     current = current.copy()
-    current['predicted_grade']   = micro_reg.predict(X).round(2)
-    current['risk_probability']  = micro_cls.predict_proba(X)[:, 1].round(3)
+    # The hosted model is fitted on NumPy float32 matrices; use the same
+    # representation at inference to avoid feature-name warnings and a hidden
+    # DataFrame-to-array conversion on every profile request.
+    X_values = X.to_numpy(dtype=np.float32, copy=False)
+    current['predicted_grade']   = micro_reg.predict(X_values).round(2)
+    current['risk_probability']  = micro_cls.predict_proba(X_values)[:, 1].round(3)
     current['risk_label'] = current['risk_probability'].apply(
         lambda p: '🔴 High Risk' if p >= 0.6
         else ('🟡 Moderate' if p >= 0.35 else '🟢 On Track')
@@ -2268,9 +3468,17 @@ def extract_curriculum_map(df, threshold=0.4, recent_years=3):
     """
     temp_df = df.copy()
 
+    if 'school_level' in temp_df.columns:
+        temp_df = temp_df[temp_df['school_level'].eq('SHS')].copy()
+        if temp_df.empty:
+            return pd.DataFrame()
+
     # 1. Re-derive strand and grade_level from section sis (authoritative source)
     if 'section sis' in temp_df.columns:
-        extracted = temp_df['section sis'].apply(process_section_info)
+        # Use a list comprehension rather than Series.apply here.  With the
+        # memory-compact corpus, ``section sis`` is categorical and pandas can
+        # interpret tuple-valued apply results as a MultiIndex.
+        extracted = [process_section_info(value) for value in temp_df['section sis'].astype(object)]
         temp_df['strand']      = [x[0] for x in extracted]
         temp_df['grade_level'] = [x[1] for x in extracted]
 
@@ -2281,9 +3489,8 @@ def extract_curriculum_map(df, threshold=0.4, recent_years=3):
             .str.extract(r'_(S[12]|[12])(?:_|$)')
             .iloc[:, 0]
             .replace({'1': 'S1', '2': 'S2'})
-            .fillna('S1')
         )
-        temp_df['semester'] = recovered.where(recovered.notna(), temp_df.get('semester', pd.NA))
+        temp_df['semester'] = recovered.combine_first(temp_df.get('semester', pd.Series(pd.NA, index=temp_df.index)))
 
     # 3. Standardize all key columns
     if 'course' in temp_df.columns:
@@ -2310,11 +3517,15 @@ def extract_curriculum_map(df, threshold=0.4, recent_years=3):
 
     # 6. Build roadmap: subject must appear in >= threshold of students per cohort
     group_counts = (
-        temp_df.groupby(['strand', 'grade_level', 'semester'])['student sis']
+        temp_df.groupby(
+            ['strand', 'grade_level', 'semester'], observed=True
+        )['student sis']
         .nunique().reset_index(name='total')
     )
     subj_counts = (
-        temp_df.groupby(['strand', 'grade_level', 'semester', 'course'])['student sis']
+        temp_df.groupby(
+            ['strand', 'grade_level', 'semester', 'course'], observed=True
+        )['student sis']
         .nunique().reset_index(name='count')
     )
     curric = subj_counts.merge(group_counts, on=['strand', 'grade_level', 'semester'])
@@ -2346,11 +3557,12 @@ def predict_future_performance(micro_reg, micro_cls, df, student_sis):
     3. Source the curriculum from extract_curriculum_map (recent 3 years,
        section sis-derived strand/grade).
     4. Skip any subject already in the student's transcript (case-insensitive,
-       matched by grade_level + course to avoid skipping G12 repeats of G11 subjects
-       with the same name).
+       matched by grade level + course). Alternate-semester rows for the same
+       grade/course are collapsed to one canonical slot using the higher
+       observed curriculum rate.
     5. Build synthetic feature rows and run the trained RF models.
     """
-    if micro_reg is None or df.empty:
+    if micro_reg is None or micro_cls is None or df.empty:
         return pd.DataFrame()
 
     # ── Step 1: Re-derive semester locally (safe extract) ───────────────────
@@ -2361,9 +3573,8 @@ def predict_future_performance(micro_reg, micro_cls, df, student_sis):
             .str.extract(r'_(S[12]|[12])(?:_|$)')
             .iloc[:, 0]
             .replace({'1': 'S1', '2': 'S2'})
-            .fillna('S1')
         )
-        local_df['semester'] = recovered.where(recovered.notna(), local_df.get('semester', pd.NA))
+        local_df['semester'] = recovered.combine_first(local_df.get('semester', pd.Series(pd.NA, index=local_df.index)))
 
     # ── Step 2: Build micro features & locate student ───────────────────────
     feat = build_micro_features(local_df)
@@ -2371,9 +3582,34 @@ def predict_future_performance(micro_reg, micro_cls, df, student_sis):
     if student_feat.empty:
         return pd.DataFrame()
 
-    # ── Step 3: Determine student's strand and latest completed term ─────────
-    student_strand = str(student_feat['strand'].iloc[0]).strip().upper()
-    latest_term_order = int(student_feat['term_order'].max())
+    # ── Step 3: Determine the student's current curriculum position ──────
+    # Use the latest valid academic enrollment, not the maximum term_order over
+    # the student's entire corpus.  The latter can incorrectly classify a
+    # currently enrolled Grade 11 learner as finished when an older malformed,
+    # transferred, or re-used record contains a Grade 12 slot.
+    position_source = student_feat.copy()
+    if 'record_type' in position_source.columns:
+        position_source = position_source[position_source['record_type'].eq('academic')]
+    position_source = position_source[
+        position_source['strand'].astype(str).str.strip().str.upper().isin(VALID_STRANDS) &
+        position_source['grade_level'].astype(str).str.strip().isin(VALID_GRADE_LEVELS) &
+        position_source['semester'].astype(str).str.strip().str.upper().isin(VALID_SEMESTERS)
+    ].dropna(subset=['year_int', 'term_order'])
+
+    if position_source.empty:
+        return pd.DataFrame()
+
+    latest_row = position_source.sort_values(['year_int', 'term_order']).iloc[-1]
+    latest_year = latest_row['year_int']
+    latest_term_order = int(latest_row['term_order'])
+
+    # Resolve the home strand from the latest year/term.  This avoids relying
+    # on whichever historical row happened to occur first in concatenation.
+    latest_position_rows = position_source[
+        (position_source['year_int'] == latest_year) &
+        (position_source['term_order'] == latest_term_order)
+    ]
+    student_strand = str(latest_position_rows['strand'].mode().iloc[0]).strip().upper()
 
     # term_order mapping: G11-S1=1, G11-S2=2, G12-S1=3, G12-S2=4
     TERM_MAP = {'11-S1': 1, '11-S2': 2, '12-S1': 3, '12-S2': 4}
@@ -2383,13 +3619,13 @@ def predict_future_performance(micro_reg, micro_cls, df, student_sis):
         # Student has completed all terms — nothing to predict
         return pd.DataFrame()
 
-    # ── Step 4: Build set of already-taken courses per grade level ───────────
-    # Key: (grade_level_str, course_upper) — prevents skipping a legitimately
-    # distinct G12 subject that shares a name with a G11 subject.
+    # ── Step 4: Build set of already-taken curriculum subjects ───────────────
+    # The corpus can place the same same-grade subject in alternate semesters
+    # for different cohorts.  Once a student has taken that subject in the
+    # grade, it should not be forecast again under the alternate slot.
     taken_set = set(
         zip(
             student_feat['grade_level'].astype(str).str.strip(),
-            student_feat['semester'].astype(str).str.strip().str.upper(),
             student_feat['course'].str.strip().str.upper()
         )
     )
@@ -2406,9 +3642,34 @@ def predict_future_performance(micro_reg, micro_cls, df, student_sis):
     if strand_curric.empty:
         return pd.DataFrame()
 
+    # One course can appear in both semesters because sections are scheduled
+    # differently across cohorts.  For the student-facing forecast, collapse
+    # these alternate same-grade slots to one canonical slot.  The highest
+    # observed rate is the best available administrative proxy for the usual
+    # placement; ties resolve to S1 for deterministic output.  Grade level is
+    # retained in the key so a legitimate Grade 11/Grade 12 repeat remains
+    # separately eligible.
+    semester_order = {'S1': 1, 'S2': 2}
+    strand_curric = strand_curric.copy()
+    strand_curric['_semester_order'] = strand_curric['semester'].map(semester_order)
+    strand_curric = (
+        strand_curric
+        .sort_values(
+            ['grade_level', 'course', 'rate', '_semester_order'],
+            ascending=[True, True, False, True]
+        )
+        .drop_duplicates(subset=['grade_level', 'course'], keep='first')
+        .drop(columns='_semester_order')
+    )
+
     # ── Step 6: Build synthetic feature rows for future subjects ────────────
-    current_avg  = student_feat['numeric_grade'].mean()
-    latest_row   = student_feat.sort_values('term_order').iloc[-1]
+    current_avg = student_feat['numeric_grade'].mean()
+    if pd.isna(current_avg):
+        current_avg = latest_row.get('cumulative_gwa', np.nan)
+    if pd.isna(current_avg):
+        current_avg = latest_row.get('prior_gwa', np.nan)
+    if pd.isna(current_avg):
+        current_avg = 85.0
 
     rows = []
     for _, item in strand_curric.iterrows():
@@ -2424,8 +3685,8 @@ def predict_future_performance(micro_reg, micro_cls, df, student_sis):
         course_name = str(item['course']).strip()
         course_upper = course_name.upper()
 
-        # Skip if already taken at this grade level
-        if (grade_lvl, semester, course_upper) in taken_set:
+        # Skip if this exact curriculum slot is already represented.
+        if (grade_lvl, course_upper) in taken_set:
             continue
 
         # Subject difficulty baseline from historical records
@@ -2440,7 +3701,7 @@ def predict_future_performance(micro_reg, micro_cls, df, student_sis):
             'term_order':    t_order,
             'strand_enc':    latest_row['strand_enc'],
             'grade_int':     int(grade_lvl),
-            'semester_enc':  1 if semester == 'S1' else 2,
+            'semester_enc':  SEMESTER_ENCODING.get(semester, np.nan),
             'prior_gwa':     current_avg,
             'cumulative_gwa': current_avg,
             'gwa_trend':     float(latest_row.get('gwa_trend', 0.0)),
@@ -2453,12 +3714,16 @@ def predict_future_performance(micro_reg, micro_cls, df, student_sis):
     if not rows:
         return pd.DataFrame()
 
-    future_df = pd.DataFrame(rows).drop_duplicates(subset=['course'])
+    future_df = pd.DataFrame(rows).drop_duplicates(
+        subset=['full_term', 'course'],
+        keep='first'
+    )
 
     # ── Step 7: Predict ──────────────────────────────────────────────────────
     X = future_df[MICRO_FEATURES].fillna(85.0)
-    future_df['predicted_grade']  = micro_reg.predict(X).round(2)
-    future_df['risk_probability'] = micro_cls.predict_proba(X)[:, 1].round(3)
+    X_values = X.to_numpy(dtype=np.float32, copy=False)
+    future_df['predicted_grade']  = micro_reg.predict(X_values).round(2)
+    future_df['risk_probability'] = micro_cls.predict_proba(X_values)[:, 1].round(3)
     future_df['numeric_grade']    = np.nan  # placeholder for dumbbell chart
     future_df['risk_label'] = future_df['risk_probability'].apply(
         lambda p: '🔴 High Risk' if p >= 0.6 else ('🟡 Moderate' if p >= 0.35 else '🟢 On Track')
@@ -2501,11 +3766,21 @@ _RISK_COLORS = {
 }
  
  
-def plot_macro_prediction_chart(pred_df, strand, grade_level):
+def plot_macro_prediction_chart(pred_df, strand, grade_level,
+                                baseline_label='Prior Actual Mean',
+                                threshold_annotation_position='top right',
+                                threshold_annotation_outside=False):
     """
     Horizontal bar chart of predicted cohort mean grades per subject.
     Bars are color-coded by risk level.
-    White diamond markers show the most recent actual mean for reference.
+    White diamond markers show the supplied reference baseline (the most recent
+    actual mean for SHS, or peer mean for JHS).
+
+    ``threshold_annotation_position`` allows the JHS chart to place the
+    threshold label on the opposite side of the reference line, where the
+    more compact subject chart otherwise lets the label sit on a bar.
+    ``threshold_annotation_outside`` places the label in the top margin rather
+    than inside the plotting area; this is used by the JHS chart.
     """
     if pred_df.empty:
         return go.Figure()
@@ -2530,7 +3805,7 @@ def plot_macro_prediction_chart(pred_df, strand, grade_level):
             '<b>%{y}</b><br>'
             'Predicted Mean: %{x:.2f}<br>'
             'Status: %{customdata[0]}<br>'
-            'Risk Probability: %{customdata[1]}<extra></extra>'
+            'Risk Score: %{customdata[1]}<extra></extra>'
         )
     ))
  
@@ -2538,20 +3813,36 @@ def plot_macro_prediction_chart(pred_df, strand, grade_level):
     if 'prior_mean' in p.columns:
         fig.add_trace(go.Scatter(
             y=p['course'], x=p['prior_mean'],
-            mode='markers', name='Prior Actual Mean',
+            mode='markers', name=baseline_label,
             marker=dict(size=9, color='white', symbol='diamond',
                         line=dict(color='grey', width=1.5)),
-            hovertemplate='<b>%{y}</b><br>Prior Mean: %{x:.2f}<extra></extra>'
+            hovertemplate=(
+                '<b>%{y}</b><br>' + baseline_label +
+                ': %{x:.2f}<extra></extra>'
+            )
         ))
  
-    # Threshold line at AT_RISK_THRESHOLD
-    fig.add_vline(
+    # Threshold line at AT_RISK_THRESHOLD. Keep the existing SHS annotation
+    # behavior unchanged; the denser JHS chart opts for a paper-coordinate
+    # annotation above the plot so it cannot overlap a horizontal bar.
+    line_kwargs = dict(
         x=AT_RISK_THRESHOLD, line_dash='dot',
-        line_color='rgba(229,115,115,0.6)', line_width=2,
-        annotation_text=f'Risk Threshold ({AT_RISK_THRESHOLD})',
-        annotation_position='top right',
-        annotation_font_color='#E57373'
+        line_color='rgba(229,115,115,0.6)', line_width=2
     )
+    if not threshold_annotation_outside:
+        line_kwargs.update(
+            annotation_text=f'Risk Threshold ({AT_RISK_THRESHOLD})',
+            annotation_position=threshold_annotation_position,
+            annotation_font_color='#E57373'
+        )
+    fig.add_vline(**line_kwargs)
+    if threshold_annotation_outside:
+        fig.add_annotation(
+            x=AT_RISK_THRESHOLD, y=1.02, xref='x', yref='paper',
+            text=f'Risk Threshold ({AT_RISK_THRESHOLD})', showarrow=False,
+            xanchor='left', yanchor='bottom',
+            font=dict(color='#E57373')
+        )
  
     fig.update_layout(
         title=f'Predicted Subject Performance — {strand} Grade {grade_level}',
@@ -2559,7 +3850,7 @@ def plot_macro_prediction_chart(pred_df, strand, grade_level):
         yaxis_title='Subject',
         legend=dict(orientation='h', y=-0.15),
         height=max(420, len(p) * 28 + 130),
-        margin=dict(l=220, r=40, t=60, b=90)
+        margin=dict(l=220, r=40, t=80 if threshold_annotation_outside else 60, b=90)
     )
     return fig
  
@@ -2568,7 +3859,7 @@ def plot_micro_prediction_chart(pred_df, student_name):
     """
     Dumbbell-style chart showing actual grade (blue dot) vs. predicted grade
     (risk-colored dot) per subject. Grey connector shows the prediction delta.
-    Sorted by risk probability descending.
+    Sorted by risk score descending.
     """
     if pred_df.empty:
         return go.Figure()
@@ -2623,8 +3914,10 @@ def plot_micro_prediction_chart(pred_df, student_name):
         fig.add_trace(go.Scatter(
             x=p['peer_mean'], y=p['course'],
             mode='markers', name='Peer Mean',
-            marker=dict(size=7, color='rgba(255,255,255,0.4)',
-                        symbol='circle-open'),
+            marker=dict(
+                size=8, color='#6B7280', symbol='circle-open',
+                line=dict(color='#6B7280', width=1.5)
+            ),
             hovertemplate='<b>%{y}</b><br>Peer Mean: %{x:.2f}<extra></extra>'
         ))
  
